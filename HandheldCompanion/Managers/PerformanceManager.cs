@@ -96,6 +96,7 @@ public static class PerformanceManager
     private const double AUTOTDP_P95_RATIO = 1.05;                 // p95 frametime above target x this => deficit (capped)
     private const double AUTOTDP_UNCAPPED_SEVERE_RATIO = 2.0;      // uncapped: only a frame longer than target x this counts as a stutter
     private const double AUTOTDP_UNCAPPED_P95_RATIO = 1.35;        // uncapped: p95 above target x this => deficit (uncapped frametimes jitter by design)
+    private const double AUTOTDP_UNCAPPED_NEAR_RATIO = 1.1;        // uncapped: tail rules only apply while the mean is within this factor of the target
     private const double AUTOTDP_TAIL_CLEAN_RATIO = 1.02;          // p95 frametime at or below target x this => tail is immaculate
     private const double AUTOTDP_UP_SETTLE_SEC = 1.0;              // minimum spacing between consecutive up-steps
     private const int AUTOTDP_UP_STEP_W = 1;                       // up-step on a tail-only deficit
@@ -169,6 +170,7 @@ public static class PerformanceManager
     private static double AutoTDPWinFps, AutoTDPSlowFps, AutoTDPP95Ratio;
     private static int AutoTDPLongFrames, AutoTDPSevereFrames;
     private static double AutoTDPDeficitStartApplied;             // level when the current deficit began (rangeMax only grows if we had to step up)
+    private static bool AutoTDPDeficitWasPower, AutoTDPInPowerDeficit;   // power deficit (mean short / tail drift) vs a lone stutter
     private static float? AutoTDPGpuLoad;
 
     // AutoTDP - dwell / descent memory for the current session
@@ -188,12 +190,11 @@ public static class PerformanceManager
     private static string AutoTDPSessionId = string.Empty;
     private static string AutoTDPSessionExecutable = string.Empty;
     private static Profile? AutoTDPSessionProfile;
-    private static string AutoTDPResumeKey = string.Empty;        // short-gap resume (alt-tab): last key (rung-agnostic), level, memory and efficiency state
-    private static double AutoTDPResumeApplied, AutoTDPResumeRangeMin, AutoTDPResumeRangeMax, AutoTDPResumeFloor, AutoTDPResumeSec;
-    private static uint? AutoTDPResumeEpp;
-    private static CoreParkingMode? AutoTDPResumeCore;
-    private static bool[]? AutoTDPResumeTried;
+    /// <summary>Where a session left off, so a short interruption (alt-tab, launcher, overlay) resumes instead of re-seeding. Keyed by the rung-agnostic key.</summary>
+    private sealed record AutoTDPResumePoint(double Applied, double RangeMin, double RangeMax, double Floor, uint? Epp, CoreParkingMode? Core, bool[] Tried, double AtSec);
+    private static readonly Dictionary<string, AutoTDPResumePoint> AutoTDPResumePoints = new(StringComparer.Ordinal);
     private const double AUTOTDP_RESUME_WINDOW_SEC = 300.0;
+    private const int AUTOTDP_RESUME_SLOTS = 8;
     private static string AutoTDPBaselineKey = string.Empty;
     private static AutoTDPBaseline? autoTDPBaseline;
     private static bool AutoTDPWarm;                              // a baseline was loaded or learned this session (Tracking)
@@ -750,7 +751,7 @@ public static class PerformanceManager
                     ManagerFactory.profileManager.SerializeProfile(profile);
             }
 
-            AutoTDPResumeKey = string.Empty;
+            AutoTDPResumePoints.Remove(AutoTDPKeyWithoutRung(AutoTDPBaselineKey));
 
             if (AutoTDPEfficiencyActive || effPhase != AutoTDPEfficiencyPhase.Idle)
             {
@@ -843,23 +844,23 @@ public static class PerformanceManager
 
         // the same game coming straight back (alt-tab, overlay) continues where it left off instead of re-seeding,
         // including any efficiency step it had already committed
-        bool resumed = string.Equals(AutoTDPKeyWithoutRung(key), AutoTDPResumeKey, StringComparison.Ordinal) && AutoTDPResumeApplied > 0 && AutoTDPNowSec - AutoTDPResumeSec < AUTOTDP_RESUME_WINDOW_SEC;
-        if (resumed)
+        bool resumed = AutoTDPResumePoints.TryGetValue(AutoTDPKeyWithoutRung(key), out AutoTDPResumePoint? resume)
+            && resume.Applied > 0 && AutoTDPNowSec - resume.AtSec < AUTOTDP_RESUME_WINDOW_SEC;
+        if (resumed && resume is not null)
         {
-            if (AutoTDPResumeEpp.HasValue || AutoTDPResumeCore.HasValue)
+            if (resume.Epp.HasValue || resume.Core.HasValue)
             {
-                effAcceptedEpp = AutoTDPResumeEpp;
-                effAcceptedCore = AutoTDPResumeCore;
-                if (AutoTDPResumeTried is not null)
-                    Array.Copy(AutoTDPResumeTried, effTried, Math.Min(effTried.Length, AutoTDPResumeTried.Length));
+                effAcceptedEpp = resume.Epp;
+                effAcceptedCore = resume.Core;
+                Array.Copy(resume.Tried, effTried, Math.Min(effTried.Length, resume.Tried.Length));
                 AutoTDPEfficiencySetState(effAcceptedEpp, effAcceptedCore);
                 AutoTDPRekeyForEfficiency();
             }
 
-            AutoTDP = Math.Clamp(AutoTDPResumeApplied, TDPMin, Math.Max(TDPMin, AutoTDPMax));
-            AutoTDPRangeMinW = AutoTDPResumeRangeMin;
-            AutoTDPRangeMaxW = AutoTDPResumeRangeMax;
-            AutoTDPFloorW = AutoTDPResumeFloor;
+            AutoTDP = Math.Clamp(resume.Applied, TDPMin, Math.Max(TDPMin, AutoTDPMax));
+            AutoTDPRangeMinW = resume.RangeMin;
+            AutoTDPRangeMaxW = resume.RangeMax;
+            AutoTDPFloorW = resume.Floor;
         }
 
         bool hooked = PlatformManager.RTSS?.HasHook() ?? false;
@@ -918,16 +919,16 @@ public static class PerformanceManager
         AutoTDPSaveBaseline(true);
         Interlocked.Increment(ref autotdpGeneration);
 
-        // remember where this key was, so a short interruption resumes rather than re-seeds
-        AutoTDPResumeKey = AutoTDPKeyWithoutRung(AutoTDPBaselineKey);
-        AutoTDPResumeApplied = AutoTDPApplied;
-        AutoTDPResumeRangeMin = AutoTDPRangeMinW;
-        AutoTDPResumeRangeMax = AutoTDPRangeMaxW;
-        AutoTDPResumeFloor = AutoTDPFloorW;
-        AutoTDPResumeEpp = effAcceptedEpp;
-        AutoTDPResumeCore = effAcceptedCore;
-        AutoTDPResumeTried = (bool[])effTried.Clone();
-        AutoTDPResumeSec = AutoTDPNowSec;
+        // remember where this key was, so a short interruption resumes rather than re-seeds; other foreground
+        // apps in between (launchers, explorer) get their own slot and do not evict the game's
+        if (AutoTDPApplied > 0)
+        {
+            AutoTDPResumePoints[AutoTDPKeyWithoutRung(AutoTDPBaselineKey)] = new AutoTDPResumePoint(
+                AutoTDPApplied, AutoTDPRangeMinW, AutoTDPRangeMaxW, AutoTDPFloorW, effAcceptedEpp, effAcceptedCore, (bool[])effTried.Clone(), AutoTDPNowSec);
+
+            while (AutoTDPResumePoints.Count > AUTOTDP_RESUME_SLOTS)
+                AutoTDPResumePoints.Remove(AutoTDPResumePoints.OrderBy(kv => kv.Value.AtSec).First().Key);
+        }
 
         AutoTDPEfficiencyClearOverrides();
 
@@ -951,9 +952,15 @@ public static class PerformanceManager
     }
 
     /// <summary>Executable that identifies the game for baseline purposes: the foreground process, else whatever RTSS has hooked.</summary>
+    /// <summary>
+    ///     Game identity for a session follows HC's own game-profile tracking: the executable of the applied game
+    ///     <see cref="Profile"/>. When the default profile is applied (no dedicated profile), the RTSS-hooked
+    ///     process names the game instead. Foreground launchers/explorer therefore never start sessions of their own.
+    /// </summary>
     private static string AutoTDPCurrentExecutable()
     {
-        string executable = ProcessManager.GetCurrent()?.Executable ?? string.Empty;
+        Profile profile = ManagerFactory.profileManager.GetCurrent();
+        string executable = profile.Default ? string.Empty : profile.Executable ?? string.Empty;
         if (string.IsNullOrEmpty(executable))
         {
             string? hooked = PlatformManager.RTSS?.GetAppEntry()?.Name;
@@ -1217,12 +1224,22 @@ public static class PerformanceManager
         double lowBand = Math.Max(AUTOTDP_LOW_BAND_FPS, 0.01 * target);
         double highBand = Math.Max(AUTOTDP_HIGH_BAND_FPS, 0.03 * target);
 
-        // Capped (limiter/VSync at the target): frametimes are flat, so any long frame or p95 drift is a real deficit.
-        // Uncapped: frametimes jitter by design; only the window mean and gross stutter count, otherwise the tail rule
-        // would force the mean far above the target.
-        bool deficit = AutoTDPCapped
-            ? AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT || AutoTDPP95Ratio > AUTOTDP_P95_RATIO || AutoTDPWinFps < target - lowBand
-            : AutoTDPWinFps < target - lowBand || AutoTDPSevereFrames >= 1 || AutoTDPP95Ratio > AUTOTDP_UNCAPPED_P95_RATIO;
+        // Two kinds of deficit. A *power* deficit is evidence the level cannot hold the target: the window mean is
+        // short, or (near the target) the tail drifts. A *stutter* is one long frame in an otherwise fine window -
+        // asset streaming, a hitch - it earns an immediate +1 W (cheap, reclaimed later) but says nothing about the
+        // level, so it never moves the floor, the back-off, the range or the MaxLimited state.
+        //   Capped (limiter/VSync at the target): frametimes are flat, so any long frame is a stutter and p95 drift is
+        //   a power deficit. Uncapped: frametimes jitter by design; the tail only counts while the mean sits near the
+        //   target, and lone long frames at a mean far above the target are ignored entirely.
+        bool meanShort = AutoTDPWinFps < target - lowBand;
+        bool tailDrift = AutoTDPCapped
+            ? AutoTDPP95Ratio > AUTOTDP_P95_RATIO
+            : AutoTDPSlowFps < target * AUTOTDP_UNCAPPED_NEAR_RATIO && AutoTDPP95Ratio > AUTOTDP_UNCAPPED_P95_RATIO;
+        bool powerDeficit = meanShort || tailDrift;
+        bool stutter = AutoTDPCapped
+            ? AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT
+            : AutoTDPSlowFps < target * AUTOTDP_UNCAPPED_NEAR_RATIO && AutoTDPSevereFrames >= 1;
+        bool deficit = powerDeficit || stutter;
         bool shortfall = AutoTDPWinFps < target - 2 * lowBand;
         bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
         bool gpuOk = AutoTDPGpuLoad is null || AutoTDPGpuLoad < AUTOTDP_GPU_GATE_PCT;
@@ -1233,16 +1250,22 @@ public static class PerformanceManager
         bool recentDescent = AutoTDPLastDownSec > 0 && now - AutoTDPLastDownSec < AUTOTDP_PROBE_FAIL_WINDOW_SEC;
         string reason;
 
+        AutoTDPInPowerDeficit = powerDeficit;
+
         if (deficit)
         {
             if (!AutoTDPInDeficit)
+            {
                 AutoTDPDeficitStartApplied = applied;
+                AutoTDPDeficitWasPower = false;
+            }
+            AutoTDPDeficitWasPower |= powerDeficit;
 
             AutoTDPHeadroomSec = 0;
             AutoTDPHoldSec = 0;
             AutoTDPDeficitSec += dt;
 
-            if (recentDescent)
+            if (recentDescent && powerDeficit)
             {
                 // the level we just stepped down to cannot hold the target: it becomes the floor's lower neighbour
                 AutoTDPFloorW = applied + 1;
@@ -1256,16 +1279,21 @@ public static class PerformanceManager
             }
             else if (now >= AutoTDPUpSettleUntilSec)
             {
-                if (AutoTDPRangeMaxW > applied)
+                if (powerDeficit && AutoTDPRangeMaxW > applied)
                 {
                     // a heavier scene we have already handled this session: jump toward its level (bounded)
                     AutoTDP = Math.Min(AutoTDPRangeMaxW, applied + AUTOTDP_MAX_JUMP_W);
                     reason = "jump";
                 }
-                else
+                else if (powerDeficit)
                 {
                     AutoTDP = applied + (shortfall ? AUTOTDP_UP_STEP_SHORTFALL_W : AUTOTDP_UP_STEP_W);
                     reason = shortfall ? "up-shortfall" : "up";
+                }
+                else
+                {
+                    AutoTDP = applied + AUTOTDP_UP_STEP_W;
+                    reason = "stutter";
                 }
                 AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
             }
@@ -1318,7 +1346,7 @@ public static class PerformanceManager
 
         // remember the level at which a deficit cleared, but only when we actually had to step up to clear it
         // (a loading screen or menu hitch at the current level says nothing about the game's heavy scenes)
-        if (!deficit && AutoTDPInDeficit && applied > AutoTDPDeficitStartApplied)
+        if (!deficit && AutoTDPInDeficit && AutoTDPDeficitWasPower && applied > AutoTDPDeficitStartApplied)
             AutoTDPRangeMaxW = Math.Max(AutoTDPRangeMaxW, applied);
         AutoTDPInDeficit = deficit;
 
@@ -1419,7 +1447,7 @@ public static class PerformanceManager
         double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
 
         // pinned at the ceiling and still short: nothing more the controller can do
-        if (deficit && applied >= AutoTDPMax - 0.5)
+        if (AutoTDPInPowerDeficit && applied >= AutoTDPMax - 0.5)
             AutoTDPMaxLimitedSec += dt;
         else
             AutoTDPMaxLimitedSec = 0;
@@ -1509,7 +1537,7 @@ public static class PerformanceManager
         AutoTDPLastDownSec = 0;
         AutoTDPDownFromW = 0;
         AutoTDPDownWasProbe = false;
-        AutoTDPInDeficit = false;
+        AutoTDPInDeficit = AutoTDPInPowerDeficit = AutoTDPDeficitWasPower = false;
         AutoTDPConvergeSec = 0;
         AutoTDPConvergedAtLevel = false;
         AutoTDPMaxLimitedSec = 0;
