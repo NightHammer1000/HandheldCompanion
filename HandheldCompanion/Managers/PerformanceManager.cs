@@ -99,8 +99,9 @@ public static class PerformanceManager
     private const double AUTOTDP_UNCAPPED_NEAR_RATIO = 1.1;        // uncapped: tail rules only apply while the mean is within this factor of the target
     private const double AUTOTDP_TAIL_CLEAN_RATIO = 1.02;          // p95 frametime at or below target x this => tail is immaculate
     private const double AUTOTDP_UP_SETTLE_SEC = 1.0;              // minimum spacing between consecutive up-steps
-    private const int AUTOTDP_UP_STEP_W = 1;                       // up-step on a tail-only deficit
-    private const int AUTOTDP_UP_STEP_SHORTFALL_W = 1;             // up-step when the mean fps is clearly short as well (kept at 1 W: larger recovery steps overshoot on device)
+    private const int AUTOTDP_UP_STEP_W = 1;                       // up-step for a tail-only deficit or a stutter
+    private const double AUTOTDP_UP_GAIN_REL = 0.05;               // +1 W per this fraction of the target the mean is short (60 fps: +1 W per 3 fps)
+    private const int AUTOTDP_UP_STEP_MAX_W = 4;                   // cap on a single proportional up-step
     private const double AUTOTDP_DOWN_DWELL_INRANGE_SEC = 5.0;     // sustained headroom required before stepping down inside the known range
     private const double AUTOTDP_DOWN_SETTLE_INRANGE_SEC = 3.0;    // spacing between down-steps inside the known range
     private const double AUTOTDP_PROBE_DWELL_SEC = 15.0;           // sustained headroom required before probing below the known floor
@@ -1267,7 +1268,6 @@ public static class PerformanceManager
             ? AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT
             : AutoTDPSlowFps < target * AUTOTDP_UNCAPPED_NEAR_RATIO && AutoTDPSevereFrames >= 1;
         bool deficit = powerDeficit || stutter;
-        bool shortfall = AutoTDPTrimFps < target - 2 * lowBand;
         bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
         // Intel GPU "load" reads ~100 % whenever the GPU is busy regardless of power (verified on device); it is not a headroom signal
         bool headroom = AutoTDPSlowFps > target + highBand || (AutoTDPCapped && tailClean);
@@ -1311,12 +1311,15 @@ public static class PerformanceManager
             }
             else if (now >= AutoTDPUpSettleUntilSec)
             {
-                // recovery is one watt per settle, two only when the mean itself is clearly short; a jump toward the
-                // session's heavy level was tried and overshoots far more than it saves (device feedback)
+                // recovery is proportional to the error: one watt for a tail-only deficit, one more per 5 % the
+                // (hitch-immune) mean is short of the target, capped. Each step is re-evaluated after the settle, so
+                // the steps shrink as the gap closes; a fixed jump toward a remembered level was tried and overshoots.
                 if (powerDeficit)
                 {
-                    AutoTDP = applied + (shortfall ? AUTOTDP_UP_STEP_SHORTFALL_W : AUTOTDP_UP_STEP_W);
-                    reason = shortfall ? "up-shortfall" : "up";
+                    double shortRel = Math.Max(0, (target - AutoTDPTrimFps) / target);
+                    int step = Math.Clamp(AUTOTDP_UP_STEP_W + (int)Math.Floor(shortRel / AUTOTDP_UP_GAIN_REL), AUTOTDP_UP_STEP_W, AUTOTDP_UP_STEP_MAX_W);
+                    AutoTDP = applied + step;
+                    reason = step > 1 ? "up+" + step : "up";
                 }
                 else
                 {
@@ -1426,7 +1429,7 @@ public static class PerformanceManager
         if (AutoTDPApplied > 0)
         {
             double delta = candidate - AutoTDPApplied;
-            double maxUp = reason == "down-fail" ? AUTOTDP_MAX_JUMP_W : AUTOTDP_MAX_STEP_W;
+            double maxUp = reason == "down-fail" || reason.StartsWith("up") ? Math.Max(AUTOTDP_MAX_JUMP_W, AUTOTDP_UP_STEP_MAX_W) : AUTOTDP_MAX_STEP_W;
             delta = Math.Clamp(delta, -AUTOTDP_MAX_STEP_DOWN_W, maxUp);
             candidate = AutoTDPApplied + delta;
         }
