@@ -9012,6 +9012,33 @@ namespace HandheldCompanion.Properties {
         }
 
         /// <summary>
+        ///   Looks up a localized string similar to optimizing.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusOptimizing {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusOptimizing", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Efficiency search.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPEfficiency {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPEfficiency", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to While tracking, trial energy preference and E-core scheduling steps and keep those that lower measured power draw without missing the frame target.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPEfficiencyDesc {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPEfficiencyDesc", resourceCulture);
+            }
+        }
+
+        /// <summary>
         ///   Looks up a localized string similar to Relearn.
         /// </summary>
         public static string ProfilesPage_AutoTDPRelearn {

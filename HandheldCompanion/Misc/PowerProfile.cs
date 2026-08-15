@@ -28,6 +28,12 @@ namespace HandheldCompanion.Misc
 
         public bool AutoTDPEnabled { get; set; }
         public float AutoTDPRequestedFPS { get; set; } = 30.0f;
+
+        /// <summary>
+        ///     Lets AutoTDP additionally trial energy/performance preference and E-core scheduling steps while it is
+        ///     tracking, keeping a step only when measured draw improves and the frame target still holds.
+        /// </summary>
+        public bool AutoTDPEfficiencyEnabled { get; set; }
         public int FramerateValue { get; set; } = 0; // default RTSS value
 
         [Obsolete("This property is deprecated and will be removed in future versions.")]

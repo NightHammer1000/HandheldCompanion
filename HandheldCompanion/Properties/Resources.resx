@@ -1185,6 +1185,15 @@ Motion input toggle: press selected button(s) to switch motion state.</value>
   <data name="ProfilesPage_AutoTDPStatusLimited" xml:space="preserve">
     <value>Limited · {0:0} W (maximum reached)</value>
   </data>
+  <data name="ProfilesPage_AutoTDPStatusOptimizing" xml:space="preserve">
+    <value>optimizing</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPEfficiency" xml:space="preserve">
+    <value>Efficiency search</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPEfficiencyDesc" xml:space="preserve">
+    <value>While tracking, trial energy preference and E-core scheduling steps and keep those that lower measured power draw without missing the frame target</value>
+  </data>
   <data name="ProfilesPage_AutoTDPRelearn" xml:space="preserve">
     <value>Relearn</value>
   </data>

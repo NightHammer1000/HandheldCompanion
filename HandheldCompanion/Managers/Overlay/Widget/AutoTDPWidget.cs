@@ -40,6 +40,11 @@ public class AutoTDPWidget : IWidget
                 entry.elements.Add(new OverlayEntryElement(status.BaselineW.Value.ToString("00", CultureInfo.InvariantCulture), "W", OverlayColors.DEFAULT_COLOR));
 
             entry.elements.Add(new OverlayEntryElement(StateWord(status), string.Empty, color));
+
+            if (!string.IsNullOrEmpty(status.EfficiencyRung))
+                entry.elements.Add(new OverlayEntryElement(status.Optimizing ? status.EfficiencyRung + "?" : status.EfficiencyRung, string.Empty, OverlayColors.DEFAULT_COLOR));
+            else if (status.Optimizing)
+                entry.elements.Add(new OverlayEntryElement("EFF?", string.Empty, OverlayColors.DEFAULT_COLOR));
         }
     }
 

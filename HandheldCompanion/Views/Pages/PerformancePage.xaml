@@ -370,6 +370,14 @@
                                     </DockPanel>
                                 </ui:SettingsCard>
 
+                                <!--  Auto TDP efficiency search  -->
+                                <ui:SettingsCard
+                                    Description="{l:Static resx:Resources.ProfilesPage_AutoTDPEfficiencyDesc}"
+                                    Header="{l:Static resx:Resources.ProfilesPage_AutoTDPEfficiency}"
+                                    IsEnabled="{Binding AutoTDPEnabled, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}">
+                                    <ui:ToggleSwitch IsOn="{Binding AutoTDPEfficiencyEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                </ui:SettingsCard>
+
                                 <!--  Auto TDP status (read-only here: a preset is shared by many games)  -->
                                 <ui:SettingsCard
                                     Description="{l:Static resx:Resources.ProfilesPage_AutoTDPStatusDesc}"

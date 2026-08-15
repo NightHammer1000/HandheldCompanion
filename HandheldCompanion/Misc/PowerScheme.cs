@@ -183,18 +183,31 @@ public static class PowerScheme
 
     public static void WritePowerCfg(Guid SubGroup, Guid Settings, uint ACValue, uint DCValue)
     {
-        if (GetActiveScheme(out var currentScheme))
+        WritePowerCfg(SubGroup, [(Settings, ACValue, DCValue)]);
+    }
+
+    /// <summary>
+    ///     Writes several settings of one subgroup and re-activates the scheme once. Every re-activation is a
+    ///     system-wide power event, so callers that change related settings together (core scheduling policies,
+    ///     EPP for both efficiency classes) should batch them here.
+    /// </summary>
+    public static void WritePowerCfg(Guid SubGroup, IEnumerable<(Guid Setting, uint ACValue, uint DCValue)> values)
+    {
+        if (!GetActiveScheme(out var currentScheme))
+            return;
+
+        foreach ((Guid setting, uint acValue, uint dcValue) in values)
         {
             // unhide attribute
-            SetAttribute(SubGroup, Settings, 2);
+            SetAttribute(SubGroup, setting, 2);
 
             // set value(s)
-            SetValue(PowerIndexType.AC, currentScheme, SubGroup, Settings, ACValue);
-            SetValue(PowerIndexType.DC, currentScheme, SubGroup, Settings, DCValue);
-
-            // activate scheme
-            SetActiveScheme(currentScheme);
+            SetValue(PowerIndexType.AC, currentScheme, SubGroup, setting, acValue);
+            SetValue(PowerIndexType.DC, currentScheme, SubGroup, setting, dcValue);
         }
+
+        // activate scheme
+        SetActiveScheme(currentScheme);
     }
 
     #region imports

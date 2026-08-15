@@ -383,25 +383,49 @@ namespace HandheldCompanion.ViewModels
             }
         }
 
+        public bool AutoTDPEfficiencyEnabled
+        {
+            get => SelectedPreset.AutoTDPEfficiencyEnabled;
+            set
+            {
+                if (value != AutoTDPEfficiencyEnabled)
+                {
+                    SelectedPreset.AutoTDPEfficiencyEnabled = value;
+                    OnPropertyChanged(nameof(AutoTDPEfficiencyEnabled));
+                }
+            }
+        }
+
         /// <summary>Live AutoTDP controller status for the currently running session (not preset-specific).</summary>
         public string AutoTDPStatusText
         {
             get
             {
                 AutoTDPStatus status = PerformanceManager.GetAutoTDPStatus();
+                string text;
                 switch (status.State)
                 {
                     case AutoTDPState.NoTelemetry:
                         return Resources.ProfilesPage_AutoTDPStatusNoTelemetry;
                     case AutoTDPState.Learning:
-                        return string.Format(Resources.ProfilesPage_AutoTDPStatusLearning, status.AppliedW);
+                        text = string.Format(Resources.ProfilesPage_AutoTDPStatusLearning, status.AppliedW);
+                        break;
                     case AutoTDPState.Tracking:
-                        return string.Format(Resources.ProfilesPage_AutoTDPStatusTracking, status.BaselineW ?? status.AppliedW, status.AppliedW);
+                        text = string.Format(Resources.ProfilesPage_AutoTDPStatusTracking, status.BaselineW ?? status.AppliedW, status.AppliedW);
+                        break;
                     case AutoTDPState.MaxLimited:
-                        return string.Format(Resources.ProfilesPage_AutoTDPStatusLimited, status.AppliedW);
+                        text = string.Format(Resources.ProfilesPage_AutoTDPStatusLimited, status.AppliedW);
+                        break;
                     default:
                         return Resources.ProfilesPage_AutoTDPStatusIdle;
                 }
+
+                if (!string.IsNullOrEmpty(status.EfficiencyRung))
+                    text += " · " + status.EfficiencyRung;
+                if (status.Optimizing)
+                    text += " · " + Resources.ProfilesPage_AutoTDPStatusOptimizing;
+
+                return text;
             }
         }
 

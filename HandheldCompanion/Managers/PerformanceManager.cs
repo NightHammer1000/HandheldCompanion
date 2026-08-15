@@ -70,9 +70,9 @@ public enum AutoTDPState
 ///     Immutable snapshot of the AutoTDP controller published on every state or applied-wattage change.
 ///     Wattages are the integer values applied to the hardware; <see cref="Fps"/> is the 2 s window mean.
 /// </summary>
-public record AutoTDPStatus(AutoTDPState State, bool Capped, double TargetFps, double Fps, double SetpointW, double AppliedW, double? BaselineW)
+public record AutoTDPStatus(AutoTDPState State, bool Capped, double TargetFps, double Fps, double SetpointW, double AppliedW, double? BaselineW, string EfficiencyRung, bool Optimizing)
 {
-    public static readonly AutoTDPStatus Idle = new(AutoTDPState.Disabled, false, 0, 0, 0, 0, null);
+    public static readonly AutoTDPStatus Idle = new(AutoTDPState.Disabled, false, 0, 0, 0, 0, null, string.Empty, false);
 }
 
 public static class PerformanceManager
@@ -183,6 +183,7 @@ public static class PerformanceManager
 
     // AutoTDP - session and persistence
     private static string AutoTDPSessionId = string.Empty;
+    private static string AutoTDPSessionExecutable = string.Empty;
     private static Profile? AutoTDPSessionProfile;
     private static string AutoTDPBaselineKey = string.Empty;
     private static AutoTDPBaseline? autoTDPBaseline;
@@ -579,7 +580,7 @@ public static class PerformanceManager
         }
 
         // apply profile defined CPU Core Parking
-        RequestCoreParkingMode(profile.CPUParkingMode);
+        RequestCoreParkingMode(EffectiveCoreMode(profile));
 
         // apply profile defined CPU Core Count
         if (profile.CPUCoreEnabled)
@@ -771,7 +772,7 @@ public static class PerformanceManager
             if (!sameSession)
             {
                 AutoTDPEndSessionCore();
-                AutoTDPBeginSession(sessionId, key, profile.AutoTDPRequestedFPS);
+                AutoTDPBeginSession(sessionId, key, profile.AutoTDPRequestedFPS, executable);
             }
             else if (!string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal))
             {
@@ -791,11 +792,12 @@ public static class PerformanceManager
             StartAutoTDPWatchdog();
     }
 
-    private static void AutoTDPBeginSession(string sessionId, string key, float targetFps)
+    private static void AutoTDPBeginSession(string sessionId, string key, float targetFps, string executable)
     {
         Interlocked.Increment(ref autotdpGeneration);
 
         AutoTDPSessionId = sessionId;
+        AutoTDPSessionExecutable = executable;
         AutoTDPSessionProfile = ManagerFactory.profileManager.GetCurrent();
         AutoTDPTargetFPS = targetFps;
         AutoTDPApplied = 0;
@@ -864,8 +866,10 @@ public static class PerformanceManager
 
         AutoTDPSaveBaseline(true);
         Interlocked.Increment(ref autotdpGeneration);
+        AutoTDPEfficiencyClearOverrides();
 
         AutoTDPSessionId = string.Empty;
+        AutoTDPSessionExecutable = string.Empty;
         AutoTDPSessionProfile = null;
         AutoTDPBaselineKey = string.Empty;
         autoTDPBaseline = null;
@@ -963,6 +967,7 @@ public static class PerformanceManager
             AutoTDPActuate(now, reason);
             AutoTDPMaintainMSR();
             AutoTDPUpdateState(now, dt, reason);
+            AutoTDPEfficiencyStep(now, dt, AutoTDPInDeficit);
             AutoTDPTrace(now, reason);
         }
         catch (Exception ex)
@@ -1367,10 +1372,10 @@ public static class PerformanceManager
         double applied = AutoTDPApplied;
         double? baseline = autoTDPBaseline is not null ? autoTDPBaseline.RecentWatts : null;
 
-        AutoTDPStatus status = new(state, AutoTDPCapped, AutoTDPTargetFPS, AutoTDPWinFps, AutoTDP, applied, baseline);
+        AutoTDPStatus status = new(state, AutoTDPCapped, AutoTDPTargetFPS, AutoTDPWinFps, AutoTDP, applied, baseline, AutoTDPEfficiencyTag(), effPhase != AutoTDPEfficiencyPhase.Idle);
         autoTDPStatus = status;
 
-        if (force || previous.State != state || previous.AppliedW != applied || previous.Capped != AutoTDPCapped)
+        if (force || previous.State != state || previous.AppliedW != applied || previous.Capped != AutoTDPCapped || previous.EfficiencyRung != status.EfficiencyRung || previous.Optimizing != status.Optimizing)
         {
             if (previous.State != state)
                 LogManager.LogInformation("AutoTDP state: {0} -> {1} ({2} W applied)", previous.State, state, applied);
@@ -1427,7 +1432,8 @@ public static class PerformanceManager
     private static string AutoTDPBuildSessionId(PowerProfile profile, string executable)
     {
         int powerLine = (int)System.Windows.Forms.SystemInformation.PowerStatus.PowerLineStatus;
-        return string.Join("|", executable.ToLowerInvariant(), profile.Guid.ToString("N"), powerLine, "r0", AutoTDPFingerprint(profile));
+        string rung = AutoTDPEfficiencyTag();
+        return string.Join("|", executable.ToLowerInvariant(), profile.Guid.ToString("N"), powerLine, rung.Length > 0 ? rung : "-", AutoTDPFingerprint(profile));
     }
 
     private static string AutoTDPBuildKey(string sessionId, float targetFps)
@@ -1589,6 +1595,447 @@ public static class PerformanceManager
 
     #endregion
 
+    #region AutoTDP efficiency ladder
+
+    /*
+     * Efficiency ladder
+     * -----------------
+     * While AutoTDP is tracking and the game is quiet, this optimiser trials one efficiency step at a time -
+     * energy/performance preference (EPP 60/75/90) and E-core scheduling (prefer / only) - and keeps a step only
+     * when measured draw drops by a significant margin and the frame target keeps holding. Draw is battery
+     * discharge on DC and CPU package power on AC (never summed with GPU power).
+     *
+     * A trial is A (30 s at the current state) -> B (30 s at the candidate, after the TDP loop settled) ->
+     * A' (30 s back at the current state); the candidate is committed when mean(A, A') - mean(B) exceeds
+     * max(0.5 W, 2 standard errors). Any deficit during B rejects the candidate; a candidate that cannot settle
+     * within the timeout is rejected too. Rejected steps and every step above them of the same kind are skipped
+     * for the session. Each rung learns its own TDP baseline (the rung is part of the baseline key).
+     *
+     * The chosen state lives in runtime overrides that the CPU watchdog and the profile apply path honour via
+     * EffectiveCoreMode; EPP is restored to the value captured before the first override when the session ends.
+     */
+
+    private enum AutoTDPEfficiencyRung { EPP60, PrefECore, EPP75, EPP90, OnlyECore }
+    private enum AutoTDPEfficiencyPhase { Idle, MeasureA, SettleB, MeasureB, SettleA, MeasureA2 }
+
+    private static readonly AutoTDPEfficiencyRung[] AutoTDPEfficiencyLadder =
+    [
+        AutoTDPEfficiencyRung.EPP60,
+        AutoTDPEfficiencyRung.PrefECore,
+        AutoTDPEfficiencyRung.EPP75,
+        AutoTDPEfficiencyRung.EPP90,
+        AutoTDPEfficiencyRung.OnlyECore,
+    ];
+
+    private const double AUTOTDP_EFF_MEASURE_SEC = 30.0;         // length of each measurement window
+    private const double AUTOTDP_EFF_QUIET_SEC = 20.0;           // TDP loop quiet (no deficit, no writes) before measuring
+    private const double AUTOTDP_EFF_SETTLE_TIMEOUT_SEC = 120.0; // candidate must settle within this or it is rejected
+    private const double AUTOTDP_EFF_COOLDOWN_SEC = 60.0;        // pause between trials
+    private const double AUTOTDP_EFF_LOCKOUT_SEC = 600.0;        // rejected candidate is not retried before this
+    private const double AUTOTDP_EFF_MIN_GAIN_W = 0.5;           // minimum accepted draw improvement
+    private const int AUTOTDP_EFF_MIN_SAMPLES = 4;               // distinct sensor samples required per window
+
+    private static AutoTDPEfficiencyPhase effPhase = AutoTDPEfficiencyPhase.Idle;
+    private static int effCandidate = -1;
+    private static readonly bool[] effTried = new bool[AutoTDPEfficiencyLadder.Length];
+    private static readonly double[] effLockoutUntilSec = new double[AutoTDPEfficiencyLadder.Length];
+    private static double effPhaseStartSec, effCooldownUntilSec;
+    private static double effSum, effSumSq;
+    private static int effCount;
+    private static float effLastSample = float.NaN;
+    private static double effMeanA, effVarA, effMeanB, effVarB;
+    private static int effCountA, effCountB;
+    private static bool effOnBattery;
+
+    private static uint? effAcceptedEpp;
+    private static CoreParkingMode? effAcceptedCore;
+    private static uint? runtimeEppOverride;
+    private static CoreParkingMode? runtimeCoreModeOverride;
+    private static uint[]? eppBeforeOverride;
+
+    /// <summary>Core scheduling mode to enforce: the efficiency ladder's runtime choice when one is active, else the profile's.</summary>
+    private static CoreParkingMode EffectiveCoreMode(PowerProfile profile) => runtimeCoreModeOverride ?? profile.CPUParkingMode;
+
+    private static bool AutoTDPEfficiencyActive => runtimeEppOverride.HasValue || runtimeCoreModeOverride.HasValue;
+
+    /// <summary>Short label of the active efficiency state for the key, status and OSD ("EPP60+PrefE"); empty when none.</summary>
+    private static string AutoTDPEfficiencyTag()
+    {
+        string tag = string.Empty;
+        if (runtimeEppOverride.HasValue)
+            tag = $"EPP{runtimeEppOverride.Value}";
+        if (runtimeCoreModeOverride.HasValue)
+            tag += (tag.Length > 0 ? "+" : string.Empty) + (runtimeCoreModeOverride.Value == CoreParkingMode.OnlyECore ? "OnlyE" : "PrefE");
+        return tag;
+    }
+
+    private static void AutoTDPEfficiencyStep(double now, double dt, bool deficit)
+    {
+        bool enabled = currentProfile?.AutoTDPEfficiencyEnabled ?? false;
+        if (!enabled)
+        {
+            // switched off mid-session: back to the profile's own settings
+            if (AutoTDPEfficiencyActive || effPhase != AutoTDPEfficiencyPhase.Idle)
+            {
+                AutoTDPEfficiencyClearOverrides();
+                if (currentProfile is not null)
+                    RequestCoreParkingMode(EffectiveCoreMode(currentProfile));
+                AutoTDPRekeyForEfficiency();
+                LogManager.LogInformation("AutoTDP efficiency: disabled, overrides cleared");
+            }
+            return;
+        }
+
+        float? sample = AutoTDPEfficiencySample();
+        if (sample is null)
+        {
+            if (effPhase != AutoTDPEfficiencyPhase.Idle)
+                AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: false, "no power sensor");
+            return;
+        }
+
+        bool quiet = AutoTDPConvergeSec >= AUTOTDP_EFF_QUIET_SEC;
+
+        switch (effPhase)
+        {
+            case AutoTDPEfficiencyPhase.Idle:
+                if (now < effCooldownUntilSec || !AutoTDPWarm || !quiet)
+                    return;
+
+                int candidate = AutoTDPEfficiencyNextCandidate(now);
+                if (candidate < 0)
+                    return;
+
+                effCandidate = candidate;
+                AutoTDPEfficiencyBeginWindow(now, AutoTDPEfficiencyPhase.MeasureA);
+                LogManager.LogInformation("AutoTDP efficiency: trialing {0} ({1})", AutoTDPEfficiencyLadder[candidate], effOnBattery ? "battery draw" : "CPU package power");
+                break;
+
+            case AutoTDPEfficiencyPhase.MeasureA:
+                if (deficit)
+                {
+                    AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: false, "deficit before trial");
+                    return;
+                }
+
+                AutoTDPEfficiencyAccumulate(sample.Value);
+                if (now - effPhaseStartSec >= AUTOTDP_EFF_MEASURE_SEC)
+                {
+                    if (effCount < AUTOTDP_EFF_MIN_SAMPLES)
+                    {
+                        AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: false, "too few samples");
+                        return;
+                    }
+
+                    (effMeanA, effVarA, effCountA) = AutoTDPEfficiencyWindowStats();
+                    AutoTDPEfficiencyApplyCandidate(effCandidate, now);
+                    effPhase = AutoTDPEfficiencyPhase.SettleB;
+                    effPhaseStartSec = now;
+                }
+                break;
+
+            case AutoTDPEfficiencyPhase.SettleB:
+                if (quiet)
+                    AutoTDPEfficiencyBeginWindow(now, AutoTDPEfficiencyPhase.MeasureB);
+                else if (now - effPhaseStartSec > AUTOTDP_EFF_SETTLE_TIMEOUT_SEC)
+                    AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: true, "candidate did not settle");
+                break;
+
+            case AutoTDPEfficiencyPhase.MeasureB:
+                if (deficit)
+                {
+                    AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: true, "deficit under candidate");
+                    return;
+                }
+
+                AutoTDPEfficiencyAccumulate(sample.Value);
+                if (now - effPhaseStartSec >= AUTOTDP_EFF_MEASURE_SEC)
+                {
+                    if (effCount < AUTOTDP_EFF_MIN_SAMPLES)
+                    {
+                        AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: false, "too few samples");
+                        return;
+                    }
+
+                    (effMeanB, effVarB, effCountB) = AutoTDPEfficiencyWindowStats();
+                    AutoTDPEfficiencyApplyAccepted(now);
+                    effPhase = AutoTDPEfficiencyPhase.SettleA;
+                    effPhaseStartSec = now;
+                }
+                break;
+
+            case AutoTDPEfficiencyPhase.SettleA:
+                if (quiet)
+                    AutoTDPEfficiencyBeginWindow(now, AutoTDPEfficiencyPhase.MeasureA2);
+                else if (now - effPhaseStartSec > AUTOTDP_EFF_SETTLE_TIMEOUT_SEC)
+                    AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: false, "did not re-settle");
+                break;
+
+            case AutoTDPEfficiencyPhase.MeasureA2:
+                if (deficit)
+                {
+                    AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: false, "deficit after trial");
+                    return;
+                }
+
+                AutoTDPEfficiencyAccumulate(sample.Value);
+                if (now - effPhaseStartSec >= AUTOTDP_EFF_MEASURE_SEC)
+                {
+                    (double meanA2, double varA2, int countA2) = AutoTDPEfficiencyWindowStats();
+                    if (countA2 >= AUTOTDP_EFF_MIN_SAMPLES)
+                    {
+                        // pool both A windows
+                        int nA = effCountA + countA2;
+                        double meanA = (effMeanA * effCountA + meanA2 * countA2) / nA;
+                        double varA = (effVarA * effCountA + varA2 * countA2) / nA;
+
+                        double gain = meanA - effMeanB;
+                        double se = Math.Sqrt(varA / Math.Max(1, nA) + effVarB / Math.Max(1, effCountB));
+                        double threshold = Math.Max(AUTOTDP_EFF_MIN_GAIN_W, 2.0 * se);
+
+                        bool commit = gain > threshold;
+                        AutoTDPEfficiencyFinishTrial(now, commit, lockout: !commit, $"gain {gain:F2} W vs threshold {threshold:F2} W");
+                    }
+                    else
+                        AutoTDPEfficiencyFinishTrial(now, commit: false, lockout: false, "too few samples");
+                }
+                break;
+        }
+    }
+
+    /// <summary>System draw to minimise: battery discharge (W) on DC, CPU package power on AC. <c>null</c> when no sensor is available.</summary>
+    private static float? AutoTDPEfficiencySample()
+    {
+        LibreHardwarePlatform? lhm = PlatformManager.LibreHardware;
+        if (lhm is null)
+            return null;
+
+        effOnBattery = System.Windows.Forms.SystemInformation.PowerStatus.PowerLineStatus == System.Windows.Forms.PowerLineStatus.Offline;
+        float? value = effOnBattery ? lhm.GetBatteryPower() : lhm.GetCPUPower();
+        if (!value.HasValue)
+            return null;
+
+        // battery power is negative while discharging; report draw as a positive number
+        return effOnBattery ? -value.Value : value.Value;
+    }
+
+    private static void AutoTDPEfficiencyBeginWindow(double now, AutoTDPEfficiencyPhase phase)
+    {
+        effPhase = phase;
+        effPhaseStartSec = now;
+        effSum = effSumSq = 0;
+        effCount = 0;
+        effLastSample = float.NaN;
+    }
+
+    /// <summary>The sensors update far slower than the tick; only distinct readings are counted so variance is not understated.</summary>
+    private static void AutoTDPEfficiencyAccumulate(float sample)
+    {
+        if (!float.IsNaN(effLastSample) && sample == effLastSample)
+            return;
+
+        effLastSample = sample;
+        effSum += sample;
+        effSumSq += (double)sample * sample;
+        effCount++;
+    }
+
+    private static (double mean, double variance, int count) AutoTDPEfficiencyWindowStats()
+    {
+        if (effCount == 0)
+            return (0, 0, 0);
+
+        double mean = effSum / effCount;
+        double variance = Math.Max(0, effSumSq / effCount - mean * mean);
+        return (mean, variance, effCount);
+    }
+
+    private static int AutoTDPEfficiencyNextCandidate(double now)
+    {
+        CoreParkingMode configured = currentProfile?.CPUParkingMode ?? CoreParkingMode.AllCoresAuto;
+
+        for (int i = 0; i < AutoTDPEfficiencyLadder.Length; i++)
+        {
+            if (effTried[i] || now < effLockoutUntilSec[i])
+                continue;
+
+            switch (AutoTDPEfficiencyLadder[i])
+            {
+                case AutoTDPEfficiencyRung.EPP60:
+                case AutoTDPEfficiencyRung.EPP75:
+                case AutoTDPEfficiencyRung.EPP90:
+                    if (AutoTDPEfficiencyRungEpp(AutoTDPEfficiencyLadder[i]) <= (effAcceptedEpp ?? 0))
+                        continue;
+                    return i;
+
+                case AutoTDPEfficiencyRung.PrefECore:
+                case AutoTDPEfficiencyRung.OnlyECore:
+                    CoreParkingMode target = AutoTDPEfficiencyLadder[i] == AutoTDPEfficiencyRung.OnlyECore ? CoreParkingMode.OnlyECore : CoreParkingMode.AllCoresPrefECore;
+                    if (AutoTDPCoreEfficiencyRank(target) <= AutoTDPCoreEfficiencyRank(effAcceptedCore ?? configured))
+                        continue;
+                    return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>Orders core scheduling modes from performance-preferring to efficiency-preferring.</summary>
+    private static int AutoTDPCoreEfficiencyRank(CoreParkingMode mode)
+    {
+        return mode switch
+        {
+            CoreParkingMode.OnlyPCore => 0,
+            CoreParkingMode.AllCoresPrefPCore => 1,
+            CoreParkingMode.AllCoresAuto => 2,
+            CoreParkingMode.AllCoresPrefECore => 3,
+            CoreParkingMode.OnlyECore => 4,
+            _ => 2,
+        };
+    }
+
+    private static uint AutoTDPEfficiencyRungEpp(AutoTDPEfficiencyRung rung)
+    {
+        return rung switch
+        {
+            AutoTDPEfficiencyRung.EPP60 => 60,
+            AutoTDPEfficiencyRung.EPP75 => 75,
+            AutoTDPEfficiencyRung.EPP90 => 90,
+            _ => 0,
+        };
+    }
+
+    private static (uint? epp, CoreParkingMode? core) AutoTDPEfficiencyCandidateState(int index)
+    {
+        AutoTDPEfficiencyRung rung = AutoTDPEfficiencyLadder[index];
+        return rung switch
+        {
+            AutoTDPEfficiencyRung.PrefECore => (effAcceptedEpp, CoreParkingMode.AllCoresPrefECore),
+            AutoTDPEfficiencyRung.OnlyECore => (effAcceptedEpp, CoreParkingMode.OnlyECore),
+            _ => (AutoTDPEfficiencyRungEpp(rung), effAcceptedCore),
+        };
+    }
+
+    private static void AutoTDPEfficiencyApplyCandidate(int index, double now)
+    {
+        (uint? epp, CoreParkingMode? core) = AutoTDPEfficiencyCandidateState(index);
+        AutoTDPEfficiencySetState(epp, core);
+        AutoTDPRekeyForEfficiency();
+    }
+
+    private static void AutoTDPEfficiencyApplyAccepted(double now)
+    {
+        AutoTDPEfficiencySetState(effAcceptedEpp, effAcceptedCore);
+        AutoTDPRekeyForEfficiency();
+    }
+
+    /// <summary>Applies an EPP/core-mode pair as the runtime override, capturing the pre-override EPP the first time.</summary>
+    private static void AutoTDPEfficiencySetState(uint? epp, CoreParkingMode? core)
+    {
+        if (epp.HasValue)
+        {
+            eppBeforeOverride ??= PowerScheme.ReadPowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.PERFEPP);
+            RequestEPP(epp.Value, epp.Value);
+        }
+        else if (eppBeforeOverride is not null && runtimeEppOverride.HasValue)
+        {
+            RequestEPP(eppBeforeOverride[0], eppBeforeOverride[1]);
+        }
+        runtimeEppOverride = epp;
+
+        runtimeCoreModeOverride = core;
+        if (currentProfile is not null)
+            RequestCoreParkingMode(EffectiveCoreMode(currentProfile));
+    }
+
+    /// <summary>Drops every runtime override (EPP restored to the captured value); the caller re-applies the profile's core mode.</summary>
+    private static void AutoTDPEfficiencyClearOverrides()
+    {
+        if (eppBeforeOverride is not null && runtimeEppOverride.HasValue)
+            RequestEPP(eppBeforeOverride[0], eppBeforeOverride[1]);
+
+        runtimeEppOverride = null;
+        runtimeCoreModeOverride = null;
+        eppBeforeOverride = null;
+        effAcceptedEpp = null;
+        effAcceptedCore = null;
+        effPhase = AutoTDPEfficiencyPhase.Idle;
+        effCandidate = -1;
+        effCooldownUntilSec = 0;
+        Array.Clear(effTried);
+        Array.Clear(effLockoutUntilSec);
+    }
+
+    private static void AutoTDPEfficiencyFinishTrial(double now, bool commit, bool lockout, string reason)
+    {
+        int candidate = effCandidate;
+        AutoTDPEfficiencyRung rung = candidate >= 0 ? AutoTDPEfficiencyLadder[candidate] : AutoTDPEfficiencyRung.EPP60;
+
+        if (candidate >= 0)
+        {
+            effTried[candidate] = true;
+            if (lockout)
+            {
+                effLockoutUntilSec[candidate] = now + AUTOTDP_EFF_LOCKOUT_SEC;
+
+                // a rejected step also rules out the more aggressive steps of the same kind for this session
+                bool isEpp = AutoTDPEfficiencyRungEpp(rung) > 0;
+                for (int i = candidate + 1; i < AutoTDPEfficiencyLadder.Length; i++)
+                    if ((AutoTDPEfficiencyRungEpp(AutoTDPEfficiencyLadder[i]) > 0) == isEpp)
+                        effTried[i] = true;
+            }
+
+            if (commit)
+            {
+                (effAcceptedEpp, effAcceptedCore) = AutoTDPEfficiencyCandidateState(candidate);
+                LogManager.LogInformation("AutoTDP efficiency: committed {0} ({1})", rung, reason);
+            }
+            else
+                LogManager.LogInformation("AutoTDP efficiency: rejected {0} ({1})", rung, reason);
+        }
+
+        // whichever phase we were in, the accepted state is what must be running now
+        if (AutoTDPEfficiencyActive || commit)
+        {
+            AutoTDPEfficiencySetState(effAcceptedEpp, effAcceptedCore);
+            AutoTDPRekeyForEfficiency();
+        }
+
+        effPhase = AutoTDPEfficiencyPhase.Idle;
+        effCandidate = -1;
+        effCooldownUntilSec = now + AUTOTDP_EFF_COOLDOWN_SEC;
+    }
+
+    /// <summary>
+    ///     The efficiency state is part of the baseline identity: switch the key softly (setpoint kept) so each rung
+    ///     learns its own TDP baseline. When the new rung has no baseline yet, the previous rung's floor and range
+    ///     stay as the prior - the plant is similar and this keeps the TDP loop from re-descending from scratch.
+    /// </summary>
+    private static void AutoTDPRekeyForEfficiency()
+    {
+        if (currentProfile is null || string.IsNullOrEmpty(AutoTDPSessionId))
+            return;
+
+        string sessionId = AutoTDPBuildSessionId(currentProfile, AutoTDPSessionExecutable);
+        string key = AutoTDPBuildKey(sessionId, (float)AutoTDPTargetFPS);
+        if (string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal))
+            return;
+
+        double rangeMin = AutoTDPRangeMinW, rangeMax = AutoTDPRangeMaxW, floor = AutoTDPFloorW;
+
+        AutoTDPSessionId = sessionId;
+        AutoTDPRetarget(key, (float)AutoTDPTargetFPS);
+
+        if (autoTDPBaseline is null)
+        {
+            AutoTDPRangeMinW = rangeMin;
+            AutoTDPRangeMaxW = rangeMax;
+            AutoTDPFloorW = floor;
+        }
+    }
+
+    #endregion
+
     private static void cpuWatchdog_Elapsed(object? sender, ElapsedEventArgs e)
     {
         if (!_performanceManagerEnabled)
@@ -1609,7 +2056,7 @@ public static class PerformanceManager
                         RequestCPUCoreCount(currentProfile.CPUCoreCount);
 
                     // Check if CPU core parking mode has changed and apply if needed
-                    RequestCoreParkingMode(currentProfile.CPUParkingMode);
+                    RequestCoreParkingMode(EffectiveCoreMode(currentProfile));
 
                     // Check if active power shceme has changed and apply if needed
                     RequestPowerMode(currentProfile.OSPowerMode);
@@ -2018,9 +2465,13 @@ public static class PerformanceManager
             curShort[0] == shortAC && curShort[1] == shortDC)
             return;
 
-        PowerScheme.WritePowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.HETEROGENEOUS_POLICY, policyAC, policyDC);
-        PowerScheme.WritePowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.HETEROGENEOUS_THREAD_SCHEDULING_POLICY, threadAC, threadDC);
-        PowerScheme.WritePowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.HETEROGENEOUS_SHORT_THREAD_SCHEDULING_POLICY, shortAC, shortDC);
+        // one scheme activation for the three related policies
+        PowerScheme.WritePowerCfg(PowerSubGroup.SUB_PROCESSOR,
+        [
+            (PowerSetting.HETEROGENEOUS_POLICY, policyAC, policyDC),
+            (PowerSetting.HETEROGENEOUS_THREAD_SCHEDULING_POLICY, threadAC, threadDC),
+            (PowerSetting.HETEROGENEOUS_SHORT_THREAD_SCHEDULING_POLICY, shortAC, shortDC),
+        ]);
 
         LogManager.LogDebug("User requested Core Parking Mode: {0}", coreParkingMode);
     }
@@ -2028,29 +2479,42 @@ public static class PerformanceManager
     [Obsolete("This function is deprecated and will be removed in future versions.")]
     private static void RequestEPP(uint EPPOverrideValue)
     {
-        var requestedEPP = new uint[2]
-        {
-            (uint)Math.Max(0, (int)EPPOverrideValue - 17),
-            (uint)Math.Max(0, (int)EPPOverrideValue)
-        };
+        uint ac = (uint)Math.Max(0, (int)EPPOverrideValue - 17);
+        uint dc = (uint)Math.Max(0, (int)EPPOverrideValue);
 
+        if (RequestEPP(ac, dc))
+            EPPChanged?.Invoke(EPPOverrideValue);
+    }
+
+    /// <summary>
+    ///     Sets the processor energy/performance preference (powercfg percent, 0 = performance .. 100 = efficiency)
+    ///     for both efficiency classes with a single scheme activation. Returns <c>true</c> when the value was
+    ///     already in place or was applied and read back successfully.
+    /// </summary>
+    private static bool RequestEPP(uint ac, uint dc)
+    {
         // Is the EPP value already correct?
         uint[] EPP = PowerScheme.ReadPowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.PERFEPP);
-        if (EPP[0] == requestedEPP[0] && EPP[1] == requestedEPP[1])
-            return;
+        if (EPP[0] == ac && EPP[1] == dc)
+            return true;
 
-        LogManager.LogDebug("User requested EPP AC: {0}, DC: {1}", requestedEPP[0], requestedEPP[1]);
+        LogManager.LogDebug("User requested EPP AC: {0}, DC: {1}", ac, dc);
 
-        // Set profile EPP
-        PowerScheme.WritePowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.PERFEPP, requestedEPP[0], requestedEPP[1]);
-        PowerScheme.WritePowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.PERFEPP1, requestedEPP[0], requestedEPP[1]);
+        PowerScheme.WritePowerCfg(PowerSubGroup.SUB_PROCESSOR,
+        [
+            (PowerSetting.PERFEPP, ac, dc),
+            (PowerSetting.PERFEPP1, ac, dc),
+        ]);
 
-        // Has the EPP value been applied?
+        // Has the value been applied?
         EPP = PowerScheme.ReadPowerCfg(PowerSubGroup.SUB_PROCESSOR, PowerSetting.PERFEPP);
-        if (EPP[0] != requestedEPP[0] || EPP[1] != requestedEPP[1])
+        if (EPP[0] != ac || EPP[1] != dc)
+        {
             LogManager.LogWarning("Failed to set requested EPP");
-        else
-            EPPChanged?.Invoke(EPPOverrideValue);
+            return false;
+        }
+
+        return true;
     }
 
     private static void RequestCPUCoreCount(int CoreCount)
