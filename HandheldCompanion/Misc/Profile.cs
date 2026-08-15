@@ -237,9 +237,9 @@ public partial class Profile : ICloneable, IComparable, INotifyPropertyChanged
     };
 
     /// <summary>
-    ///     AutoTDP baselines learned for this profile, keyed by the control configuration they were learned
-    ///     under (executable, power profile, power source, target FPS, efficiency rung and a settings
-    ///     fingerprint — see <c>PerformanceManager</c>). Kept even while AutoTDP is disabled; bounded in size.
+    ///     AutoTDP baselines learned for this profile: one per executable and power profile
+    ///     (key <c>executable|powerProfileGuid</c>, see <c>PerformanceManager</c>). Kept even while AutoTDP is
+    ///     disabled; bounded in size.
     /// </summary>
     public Dictionary<string, AutoTDPBaseline> AutoTDPBaselines { get; set; } = new();
 

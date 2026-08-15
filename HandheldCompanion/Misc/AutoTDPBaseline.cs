@@ -3,14 +3,17 @@ using System;
 namespace HandheldCompanion.Misc
 {
     /// <summary>
-    ///     Learned AutoTDP operating point for one game under one control configuration, persisted on the
-    ///     game's <see cref="Profile"/> (see <see cref="Profile.AutoTDPBaselines"/>). Values are watts as
-    ///     applied to the hardware (integer quanta). A baseline is a warm-start hint for the controller,
-    ///     never a hard bound: upward correction is always allowed regardless of the stored range.
+    ///     Learned AutoTDP operating point for one game under one power profile, persisted on the game's
+    ///     <see cref="Profile"/> (see <see cref="Profile.AutoTDPBaselines"/>). Values are watts as applied to
+    ///     the hardware (integer quanta). A baseline is a warm-start hint for the controller, never a hard
+    ///     bound: upward correction is always allowed regardless of the stored range.
     /// </summary>
     [Serializable]
     public class AutoTDPBaseline
     {
+        /// <summary>Target frame rate the range was learned for; a different target starts a fresh range.</summary>
+        public float TargetFps { get; set; }
+
         /// <summary>Slow EWMA of converged hold levels across sessions.</summary>
         public double TypicalWatts { get; set; }
 

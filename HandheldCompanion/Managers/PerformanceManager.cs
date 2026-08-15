@@ -718,19 +718,23 @@ public static class PerformanceManager
      * the tail before the mean framerate moves, which is what keeps a limiter-capped target (e.g. 30/30) stable.
      *
      * Control law (asymmetric, memory-based):
-     *   deficit  -> step up immediately, never gated by a down-settle. A deficit shortly after a down-step marks
-     *               that descent as failed: the level above becomes the known floor, the setpoint returns to the
-     *               level the descent started from, and further probing below the floor backs off exponentially.
-     *               Inside a session's known heavy range the recovery jumps (bounded) toward the heaviest level
-     *               that has already cleared a deficit, so a wall -> open-world transition costs frames, not seconds.
+     *   deficit  -> step up immediately, never gated by a down-settle: one watt for a lone long frame (a stutter),
+     *               one watt plus one per 5 % the hitch-immune mean is short for a power deficit. A power deficit
+     *               shortly after a down-step marks that descent as failed: the level above becomes the known
+     *               floor, the setpoint returns to the level the descent started from, and further probing below
+     *               the floor backs off exponentially; a failure whose deficit only clears well above that level
+     *               was a scene change and is undone. Under a limiter a lone long frame right after a descent is a
+     *               strike; the level fails when separate attempts strike it again.
      *   headroom -> after a dwell, step down: quickly while above the known floor, cautiously (probe) below it.
      *               Headroom is a sustained uncapped surplus, or - when the framerate is capped by a limiter/VSync -
-     *               an immaculate frametime tail with the GPU below saturation.
+     *               an immaculate frametime tail. Utilisation counters are not a headroom signal on either vendor.
      *   otherwise-> hold.
      *
      * Learning/Tracking are persistence states, not control bounds: Tracking is Learning with a warm start from a
-     * baseline stored on the game's Profile (AutoTDPBaselines). Upward correction is never limited by the stored
-     * range; a heavier scene simply grows the range.
+     * baseline stored on the game's Profile (AutoTDPBaselines, one per game and power profile). Learning completes
+     * when the floor is established (probes below it failed AUTOTDP_PROBE_MAX_FAILURES times in a row); the baseline
+     * then sits in the lower part of the learned range and seeds later sessions. Upward correction is never limited
+     * by the stored range; a heavier scene simply grows the range.
      *
      * Threading: the tick owns the controller state under autotdpLock and never blocks on any other lock (profile
      * locks are TryEnter'd, writes are fire-and-forget). Profile/RTSS callbacks take autotdpLock blocking; they are
@@ -761,6 +765,13 @@ public static class PerformanceManager
             if (!profile.AutoTDPBaselines.TryGetValue(key, out AutoTDPBaseline? entry) || entry is null)
                 profile.AutoTDPBaselines[key] = entry = new AutoTDPBaseline();
 
+            if (entry.TargetFps <= 0)
+            {
+                string[] parts = key.Split('|');
+                if (parts.Length > 1 && Guid.TryParseExact(parts[1], "N", out Guid presetGuid))
+                    entry.TargetFps = ManagerFactory.powerProfileManager.GetProfile(presetGuid)?.AutoTDPRequestedFPS ?? 0;
+            }
+
             entry.MinWatts = min;
             entry.MaxWatts = max;
             entry.RecentWatts = recent;
@@ -778,6 +789,7 @@ public static class PerformanceManager
             if (!string.IsNullOrEmpty(AutoTDPSessionId) && string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal) && ReferenceEquals(profile, AutoTDPSessionProfile))
             {
                 autoTDPBaseline ??= new AutoTDPBaseline();
+                autoTDPBaseline.TargetFps = (float)AutoTDPTargetFPS;
                 autoTDPBaseline.MinWatts = min;
                 autoTDPBaseline.MaxWatts = max;
                 autoTDPBaseline.RecentWatts = recent;
@@ -840,15 +852,16 @@ public static class PerformanceManager
         autotdpLock.Enter();
         try
         {
-            // drop this game/target's baselines for every efficiency rung, then start over at the configured rung
+            // drop this game's baseline for the power profile (and any left by earlier builds), then start over at
+            // the configured efficiency rung
             Profile? profile = AutoTDPSessionProfile;
             if (profile is not null && !string.IsNullOrEmpty(AutoTDPBaselineKey))
             {
-                string identity = AutoTDPKeyWithoutRung(AutoTDPBaselineKey);
+                string key = AutoTDPBaselineKey;
                 int removed;
                 lock (profile.SyncRoot)
                 {
-                    List<string> keys = profile.AutoTDPBaselines.Keys.Where(k => AutoTDPKeyWithoutRung(k) == identity).ToList();
+                    List<string> keys = profile.AutoTDPBaselines.Keys.Where(k => k == key || AutoTDPIsLegacyKeyOf(k, key)).ToList();
                     removed = keys.Count;
                     foreach (string k in keys)
                         profile.AutoTDPBaselines.Remove(k);
@@ -858,17 +871,11 @@ public static class PerformanceManager
                     ManagerFactory.profileManager.SerializeProfile(profile);
             }
 
-            AutoTDPResumePoints.Remove(AutoTDPKeyWithoutRung(AutoTDPBaselineKey));
+            AutoTDPResumePoints.Remove(AutoTDPBaselineKey);
 
-            if (AutoTDPEfficiencyActive || effPhase != AutoTDPEfficiencyPhase.Idle)
-            {
-                AutoTDPEfficiencyClearOverrides();
-                if (currentProfile is not null)
-                    RequestCoreParkingMode(EffectiveCoreMode(currentProfile));
-                AutoTDPRekeyForEfficiency();
-            }
-            else
-                AutoTDPEfficiencyClearOverrides();
+            AutoTDPEfficiencyClearOverrides();
+            if ((AutoTDPEfficiencyActive || effPhase != AutoTDPEfficiencyPhase.Idle) && currentProfile is not null)
+                RequestCoreParkingMode(EffectiveCoreMode(currentProfile));
 
             autoTDPBaseline = null;
             AutoTDPBaselineDirty = false;
@@ -892,27 +899,26 @@ public static class PerformanceManager
 
     /// <summary>
     ///     Entry point from <see cref="PowerProfileManager_Applied"/>. Starts a new controller session when the
-    ///     game, power profile, power source or fingerprint changed; re-targets softly when only the requested FPS
-    ///     moved (the slider re-applies the profile on every tick); otherwise only refreshes the ceiling.
+    ///     game or power profile changed; re-targets softly when only the requested FPS moved (the slider re-applies
+    ///     the profile on every tick); otherwise only refreshes the ceiling.
     /// </summary>
     private static void AutoTDPApplyProfile(PowerProfile profile, double autoMax)
     {
         string executable = AutoTDPCurrentExecutable();
-        string sessionId = AutoTDPBuildSessionId(profile, executable);
-        string key = AutoTDPBuildKey(sessionId, profile.AutoTDPRequestedFPS);
+        string key = AutoTDPBuildKey(profile, executable);
 
         autotdpLock.Enter();
         try
         {
             AutoTDPMax = autoMax;
 
-            bool sameSession = !string.IsNullOrEmpty(AutoTDPSessionId) && string.Equals(sessionId, AutoTDPSessionId, StringComparison.Ordinal);
+            bool sameSession = !string.IsNullOrEmpty(AutoTDPSessionId) && string.Equals(key, AutoTDPSessionId, StringComparison.Ordinal);
             if (!sameSession)
             {
                 AutoTDPEndSessionCore();
-                AutoTDPBeginSession(sessionId, key, profile.AutoTDPRequestedFPS, executable);
+                AutoTDPBeginSession(key, profile.AutoTDPRequestedFPS, executable);
             }
-            else if (!string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal))
+            else if (Math.Abs(profile.AutoTDPRequestedFPS - AutoTDPTargetFPS) >= 0.5)
             {
                 AutoTDPRetarget(key, profile.AutoTDPRequestedFPS);
             }
@@ -930,11 +936,11 @@ public static class PerformanceManager
             StartAutoTDPWatchdog();
     }
 
-    private static void AutoTDPBeginSession(string sessionId, string key, float targetFps, string executable)
+    private static void AutoTDPBeginSession(string key, float targetFps, string executable)
     {
         Interlocked.Increment(ref autotdpGeneration);
 
-        AutoTDPSessionId = sessionId;
+        AutoTDPSessionId = key;
         AutoTDPSessionExecutable = executable;
         AutoTDPSessionProfile = ManagerFactory.profileManager.GetCurrent();
         AutoTDPTargetFPS = targetFps;
@@ -970,8 +976,8 @@ public static class PerformanceManager
 
         // the same game coming straight back (alt-tab, overlay) continues where it left off instead of re-seeding,
         // including any efficiency step it had already committed
-        bool resumed = AutoTDPResumePoints.TryGetValue(AutoTDPKeyWithoutRung(key), out AutoTDPResumePoint? resume)
-            && resume.Applied > 0 && AutoTDPNowSec - resume.AtSec < AUTOTDP_RESUME_WINDOW_SEC;
+        bool resumed = AutoTDPResumePoints.TryGetValue(key, out AutoTDPResumePoint? resume)
+            && resume is not null && resume.Applied > 0 && AutoTDPNowSec - resume.AtSec < AUTOTDP_RESUME_WINDOW_SEC;
         if (resumed && resume is not null)
         {
             if (resume.Epp.HasValue || resume.Core.HasValue)
@@ -980,7 +986,6 @@ public static class PerformanceManager
                 effAcceptedCore = resume.Core;
                 Array.Copy(resume.Tried, effTried, Math.Min(effTried.Length, resume.Tried.Length));
                 AutoTDPEfficiencySetState(effAcceptedEpp, effAcceptedCore);
-                AutoTDPRekeyForEfficiency();
             }
 
             AutoTDP = Math.Clamp(resume.Applied, TDPMin, Math.Max(TDPMin, AutoTDPMax));
@@ -1054,7 +1059,7 @@ public static class PerformanceManager
         // apps in between (launchers, explorer) get their own slot and do not evict the game's
         if (AutoTDPApplied > 0)
         {
-            AutoTDPResumePoints[AutoTDPKeyWithoutRung(AutoTDPBaselineKey)] = new AutoTDPResumePoint(
+            AutoTDPResumePoints[AutoTDPBaselineKey] = new AutoTDPResumePoint(
                 AutoTDPApplied, AutoTDPRangeMinW, AutoTDPRangeMaxW, AutoTDPFloorW, effAcceptedEpp, effAcceptedCore, (bool[])effTried.Clone(), AutoTDPNowSec);
 
             while (AutoTDPResumePoints.Count > AUTOTDP_RESUME_SLOTS)
@@ -1120,10 +1125,9 @@ public static class PerformanceManager
             if (string.IsNullOrEmpty(AutoTDPSessionExecutable) && currentProfile is not null && !string.IsNullOrEmpty(appEntry?.Name))
             {
                 AutoTDPSessionExecutable = Path.GetFileName(appEntry.Name);
-                string sessionId = AutoTDPBuildSessionId(currentProfile, AutoTDPSessionExecutable);
-                string key = AutoTDPBuildKey(sessionId, (float)AutoTDPTargetFPS);
+                string key = AutoTDPBuildKey(currentProfile, AutoTDPSessionExecutable);
 
-                AutoTDPSessionId = sessionId;
+                AutoTDPSessionId = key;
                 bool resumed = AutoTDPStartFromBaseline(key);
                 LogManager.LogInformation("AutoTDP session adopted {0}: key={1}, seed={2} W, warm={3}, resumed={4}", AutoTDPSessionExecutable, key, AutoTDP, AutoTDPWarm, resumed);
                 AutoTDPPublish(AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning, AutoTDPNowSec, true);
@@ -1745,6 +1749,7 @@ public static class PerformanceManager
         autoTDPBaseline ??= new AutoTDPBaseline();
 
         double sessionMax = Math.Max(AutoTDPRangeMaxW, level);
+        autoTDPBaseline.TargetFps = (float)AutoTDPTargetFPS;
         autoTDPBaseline.RecentWatts = level;
         autoTDPBaseline.TypicalWatts = autoTDPBaseline.Samples == 0
             ? level
@@ -1834,60 +1839,29 @@ public static class PerformanceManager
 
     #region AutoTDP persistence
 
-    private static string AutoTDPBuildSessionId(PowerProfile profile, string executable)
+    /// <summary>
+    ///     One baseline per game and power profile: <c>executable|powerProfileGuid</c>. The target frame rate,
+    ///     power source, efficiency rung and power-profile settings are not part of the identity - the target is
+    ///     stored on the baseline (a different target starts the range over), the rest is tracked live.
+    /// </summary>
+    private static string AutoTDPBuildKey(PowerProfile profile, string executable)
     {
-        int powerLine = (int)System.Windows.Forms.SystemInformation.PowerStatus.PowerLineStatus;
-        string rung = AutoTDPEfficiencyTag();
-        return string.Join("|", executable.ToLowerInvariant(), profile.Guid.ToString("N"), powerLine, rung.Length > 0 ? rung : "-", AutoTDPFingerprint(profile));
+        return string.Join("|", executable.ToLowerInvariant(), profile.Guid.ToString("N"));
     }
 
-    private static string AutoTDPBuildKey(string sessionId, float targetFps)
+    /// <summary>
+    ///     True for a key written by an earlier build for the same game and power profile
+    ///     (<c>executable|guid|powerLine|rung|fingerprint|target</c>); such entries are folded into the current key.
+    /// </summary>
+    private static bool AutoTDPIsLegacyKeyOf(string candidate, string key)
     {
-        return string.Concat(sessionId, "|", Math.Round(targetFps).ToString(CultureInfo.InvariantCulture));
+        return candidate.Length > key.Length && candidate.StartsWith(key, StringComparison.Ordinal) && candidate[key.Length] == '|';
     }
 
-    /// <summary>Key with the efficiency-rung segment blanked; identifies "this game, this target" across rungs.</summary>
-    private static string AutoTDPKeyWithoutRung(string key)
+    private static float AutoTDPLegacyKeyTarget(string legacyKey)
     {
-        return AutoTDPKeyWithSegment(key, 3, "-");
-    }
-
-    /// <summary>Key with the fingerprint segment blanked; identifies "this game, preset, power line, rung, target" across power-profile edits.</summary>
-    private static string AutoTDPKeyWithoutFingerprint(string key)
-    {
-        return AutoTDPKeyWithSegment(key, 4, "-");
-    }
-
-    private static string AutoTDPKeyWithSegment(string key, int index, string value)
-    {
-        string[] parts = key.Split('|');
-        if (parts.Length > index)
-            parts[index] = value;
-        return string.Join("|", parts);
-    }
-
-    /// <summary>Stable 32-bit FNV-1a over the power-profile fields that change the fps/W relationship.</summary>
-    private static string AutoTDPFingerprint(PowerProfile profile)
-    {
-        string source = string.Join(";",
-            ManagerFactory.settingsManager.GetInt("ConfigurableTDPMethod"),
-            profile.CPUOverrideEnabled, profile.CPUOverrideValue.ToString(CultureInfo.InvariantCulture),
-            profile.GPUOverrideEnabled, profile.GPUOverrideValue.ToString(CultureInfo.InvariantCulture),
-            (int)profile.CPUBoostLevel,
-            profile.OSPowerMode.ToString("N"),
-            profile.IntelEnduranceGamingEnabled, profile.IntelEnduranceGamingPreset,
-            profile.OEMPowerMode,
-            profile.FramerateValue,
-            (int)profile.CPUParkingMode,
-            profile.CPUCoreEnabled, profile.CPUCoreCount);
-
-        uint hash = 2166136261;
-        foreach (char c in source)
-        {
-            hash ^= c;
-            hash *= 16777619;
-        }
-        return hash.ToString("x8");
+        string[] parts = legacyKey.Split('|');
+        return parts.Length > 5 && float.TryParse(parts[5], NumberStyles.Float, CultureInfo.InvariantCulture, out float target) ? target : 0;
     }
 
     private static void AutoTDPLoadBaseline(string key)
@@ -1907,42 +1881,54 @@ public static class PerformanceManager
         bool migrated = false;
         lock (profile.SyncRoot)
         {
-            AutoTDPBaseline? exact = profile.AutoTDPBaselines.TryGetValue(key, out AutoTDPBaseline? stored) && stored is not null && stored.Samples > 0 ? stored : null;
+            AutoTDPBaseline? stored = profile.AutoTDPBaselines.TryGetValue(key, out AutoTDPBaseline? entry) && entry is not null && entry.Samples > 0 ? entry : null;
 
-            // entries learned under an earlier edit of the power profile (different fingerprint) still hold the best
-            // knowledge about this game: an established floor beats a range that is still open, and any range beats
-            // starting from scratch. Such an entry moves to the current key instead of the game being learned again;
-            // its floor keeps its status and is revalidated by the usual quiet-time rule.
-            string identity = AutoTDPKeyWithoutFingerprint(key);
-            List<KeyValuePair<string, AutoTDPBaseline>> siblings = profile.AutoTDPBaselines
-                .Where(kv => kv.Key != key && kv.Value is not null && kv.Value.Samples > 0 && AutoTDPKeyWithoutFingerprint(kv.Key) == identity)
-                .OrderByDescending(kv => kv.Value.FloorLocked)
-                .ThenByDescending(kv => kv.Value.LastUpdatedUtc)
+            // entries written by earlier builds carried the power source, efficiency rung, settings fingerprint and
+            // target in the key, so one game could own several. They fold into the single entry: an established floor
+            // beats an open one, newer beats older; the target moves from the key onto the entry
+            List<KeyValuePair<string, AutoTDPBaseline>> legacy = profile.AutoTDPBaselines
+                .Where(kv => AutoTDPIsLegacyKeyOf(kv.Key, key))
                 .ToList();
 
-            KeyValuePair<string, AutoTDPBaseline> sibling = siblings.FirstOrDefault();
-            if (exact is not null && (sibling.Value is null || exact.FloorLocked || !sibling.Value.FloorLocked))
+            if (legacy.Count > 0)
             {
-                autoTDPBaseline = exact.Clone();
-            }
-            else if (sibling.Value is not null)
-            {
-                autoTDPBaseline = sibling.Value.Clone();
-                profile.AutoTDPBaselines.Remove(sibling.Key);
-                profile.AutoTDPBaselines[key] = sibling.Value;
+                foreach (KeyValuePair<string, AutoTDPBaseline> kv in legacy)
+                {
+                    if (kv.Value is not null && kv.Value.TargetFps <= 0)
+                        kv.Value.TargetFps = AutoTDPLegacyKeyTarget(kv.Key);
+                    profile.AutoTDPBaselines.Remove(kv.Key);
+                }
+
+                AutoTDPBaseline? best = legacy
+                    .Select(kv => kv.Value)
+                    .Where(b => b is not null && b.Samples > 0 && Math.Abs(b.TargetFps - AutoTDPTargetFPS) < 0.5)
+                    .OrderByDescending(b => b!.FloorLocked)
+                    .ThenByDescending(b => b!.LastUpdatedUtc)
+                    .FirstOrDefault();
+
+                if (best is not null && (stored is null || (!stored.FloorLocked && best.FloorLocked)))
+                {
+                    profile.AutoTDPBaselines[key] = best;
+                    stored = best;
+                }
                 migrated = true;
             }
+
+            // the stored range belongs to the target it was learned for; another target starts over (the entry is
+            // replaced when the new range first converges, so passing through targets on the slider loses nothing)
+            if (stored is not null && Math.Abs(stored.TargetFps - AutoTDPTargetFPS) < 0.5)
+                autoTDPBaseline = stored.Clone();
+        }
+
+        if (migrated)
+        {
+            LogManager.LogInformation("AutoTDP baselines of earlier builds folded into {0}", key);
+            Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
+            AutoTDPRaiseBaselinesChanged(profile);
         }
 
         if (autoTDPBaseline is null)
             return;
-
-        if (migrated)
-        {
-            LogManager.LogInformation("AutoTDP baseline migrated to {0} (power profile changed since it was learned)", key);
-            Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
-            AutoTDPRaiseBaselinesChanged(profile);
-        }
 
         // a stored baseline seeds and bounds the session; it only counts as "learned" (Tracking) once its floor was
         // established - otherwise the session continues in Learning until the floor probing completes
@@ -2093,7 +2079,8 @@ public static class PerformanceManager
      * A' (30 s back at the current state); the candidate is committed when mean(A, A') - mean(B) exceeds
      * max(0.5 W, 2 standard errors). Any deficit during B rejects the candidate; a candidate that cannot settle
      * within the timeout is rejected too. Rejected steps and every step above them of the same kind are skipped
-     * for the session. Each rung learns its own TDP baseline (the rung is part of the baseline key).
+     * for the session. The TDP baseline is shared across rungs (one per game and power profile); the TDP loop
+     * simply keeps tracking through a rung change, and a rung's floor difference shows up as a probe result.
      *
      * The chosen state lives in runtime overrides that the CPU watchdog and the profile apply path honour via
      * EffectiveCoreMode; EPP is restored to the value captured before the first override when the session ends.
@@ -2164,7 +2151,6 @@ public static class PerformanceManager
                 AutoTDPEfficiencyClearOverrides();
                 if (currentProfile is not null)
                     RequestCoreParkingMode(EffectiveCoreMode(currentProfile));
-                AutoTDPRekeyForEfficiency();
                 LogManager.LogInformation("AutoTDP efficiency: disabled, overrides cleared");
             }
             return;
@@ -2404,13 +2390,11 @@ public static class PerformanceManager
     {
         (uint? epp, CoreParkingMode? core) = AutoTDPEfficiencyCandidateState(index);
         AutoTDPEfficiencySetState(epp, core);
-        AutoTDPRekeyForEfficiency();
     }
 
     private static void AutoTDPEfficiencyApplyAccepted(double now)
     {
         AutoTDPEfficiencySetState(effAcceptedEpp, effAcceptedCore);
-        AutoTDPRekeyForEfficiency();
     }
 
     /// <summary>Applies an EPP/core-mode pair as the runtime override, capturing the pre-override EPP the first time.</summary>
@@ -2480,42 +2464,11 @@ public static class PerformanceManager
 
         // whichever phase we were in, the accepted state is what must be running now
         if (AutoTDPEfficiencyActive || commit)
-        {
             AutoTDPEfficiencySetState(effAcceptedEpp, effAcceptedCore);
-            AutoTDPRekeyForEfficiency();
-        }
 
         effPhase = AutoTDPEfficiencyPhase.Idle;
         effCandidate = -1;
         effCooldownUntilSec = now + AUTOTDP_EFF_COOLDOWN_SEC;
-    }
-
-    /// <summary>
-    ///     The efficiency state is part of the baseline identity: switch the key softly (setpoint kept) so each rung
-    ///     learns its own TDP baseline. When the new rung has no baseline yet, the previous rung's floor and range
-    ///     stay as the prior - the plant is similar and this keeps the TDP loop from re-descending from scratch.
-    /// </summary>
-    private static void AutoTDPRekeyForEfficiency()
-    {
-        if (currentProfile is null || string.IsNullOrEmpty(AutoTDPSessionId))
-            return;
-
-        string sessionId = AutoTDPBuildSessionId(currentProfile, AutoTDPSessionExecutable);
-        string key = AutoTDPBuildKey(sessionId, (float)AutoTDPTargetFPS);
-        if (string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal))
-            return;
-
-        double rangeMin = AutoTDPRangeMinW, rangeMax = AutoTDPRangeMaxW, floor = AutoTDPFloorW;
-
-        AutoTDPSessionId = sessionId;
-        AutoTDPRetarget(key, (float)AutoTDPTargetFPS);
-
-        if (autoTDPBaseline is null)
-        {
-            AutoTDPRangeMinW = rangeMin;
-            AutoTDPRangeMaxW = rangeMax;
-            AutoTDPFloorW = floor;
-        }
     }
 
     #endregion

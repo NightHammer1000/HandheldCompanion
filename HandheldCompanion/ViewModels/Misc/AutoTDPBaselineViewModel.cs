@@ -8,9 +8,9 @@ using Resources = HandheldCompanion.Properties.Resources;
 namespace HandheldCompanion.ViewModels.Misc
 {
     /// <summary>
-    ///     One learned AutoTDP baseline of a game profile as shown on the profile page: which configuration it
-    ///     belongs to (power preset, power source, target FPS, efficiency step) and its editable range. Edits are
-    ///     written through <see cref="PerformanceManager.SetAutoTDPBaseline"/>, which also updates a running session.
+    ///     One learned AutoTDP baseline of a game profile as shown on the profile page: which power preset it
+    ///     belongs to, the target it was learned for, and its editable range. Edits are written through
+    ///     <see cref="PerformanceManager.SetAutoTDPBaseline"/>, which also updates a running session.
     /// </summary>
     public class AutoTDPBaselineViewModel : BaseViewModel
     {
@@ -26,16 +26,14 @@ namespace HandheldCompanion.ViewModels.Misc
             _baseline = baseline.RecentWatts;
             _max = baseline.MaxWatts;
 
-            // key layout: executable | power profile guid | power line | efficiency rung | fingerprint | target fps
+            // key layout: executable | power profile guid
             string[] parts = key.Split('|');
             string presetName = string.Empty;
             if (parts.Length > 1 && Guid.TryParseExact(parts[1], "N", out Guid presetGuid))
                 presetName = ManagerFactory.powerProfileManager.GetProfile(presetGuid)?.Name ?? string.Empty;
-            string powerLine = parts.Length > 2 && parts[2] == "1" ? Resources.ProfilesPage_AutoTDPBaselinePlugged : Resources.ProfilesPage_AutoTDPBaselineBattery;
-            string rung = parts.Length > 3 && parts[3] != "-" ? " · " + parts[3] : string.Empty;
-            string target = parts.Length > 5 ? parts[5] : "?";
+            string target = baseline.TargetFps > 0 ? Math.Round(baseline.TargetFps).ToString(CultureInfo.InvariantCulture) : "?";
 
-            Header = $"{presetName} · {powerLine} · {target} FPS{rung}".TrimStart(' ', '·');
+            Header = $"{presetName} · {target} FPS".TrimStart(' ', '·');
             Description = string.Format(Resources.ProfilesPage_AutoTDPBaselineEntryDesc,
                 baseline.LastUpdatedUtc == default ? "-" : baseline.LastUpdatedUtc.ToLocalTime().ToString("g", CultureInfo.CurrentCulture),
                 baseline.FloorLocked ? Resources.ProfilesPage_AutoTDPBaselineFloorLocked : Resources.ProfilesPage_AutoTDPBaselineFloorOpen,

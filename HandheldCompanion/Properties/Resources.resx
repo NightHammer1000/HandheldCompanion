@@ -1201,7 +1201,7 @@ Motion input toggle: press selected button(s) to switch motion state.</value>
     <value>Learned baselines</value>
   </data>
   <data name="ProfilesPage_AutoTDPBaselinesDesc" xml:space="preserve">
-    <value>What AutoTDP has learned for this game per power preset, power source and frame target. Adjust the floor (never below), the baseline it starts from and the heavy-scene maximum, or remove an entry to learn it again.</value>
+    <value>What AutoTDP has learned for this game, one entry per power preset. Adjust the floor (never below), the baseline it starts from and the heavy-scene maximum, or remove an entry to learn it again.</value>
   </data>
   <data name="ProfilesPage_AutoTDPBaselineMin" xml:space="preserve">
     <value>Floor (W)</value>
