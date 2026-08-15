@@ -733,6 +733,92 @@ public static class PerformanceManager
     public static AutoTDPStatus GetAutoTDPStatus() => autoTDPStatus;
 
     /// <summary>
+    ///     Manual override of a learned baseline from the game profile page. Writes min/baseline/max into the
+    ///     profile (floor marked established: the user asserted the limit), serialises it, and - when the entry is
+    ///     the running session's - applies the new range to the controller immediately.
+    /// </summary>
+    public static void SetAutoTDPBaseline(Profile profile, string key, double minWatts, double baselineWatts, double maxWatts)
+    {
+        if (profile is null || string.IsNullOrEmpty(key))
+            return;
+
+        double min = Math.Clamp(Math.Round(minWatts), TDPMin, TDPMax);
+        double max = Math.Clamp(Math.Round(maxWatts), min, TDPMax);
+        double recent = Math.Clamp(Math.Round(baselineWatts), min, max);
+
+        lock (profile.SyncRoot)
+        {
+            if (!profile.AutoTDPBaselines.TryGetValue(key, out AutoTDPBaseline? entry) || entry is null)
+                profile.AutoTDPBaselines[key] = entry = new AutoTDPBaseline();
+
+            entry.MinWatts = min;
+            entry.MaxWatts = max;
+            entry.RecentWatts = recent;
+            entry.TypicalWatts = recent;
+            entry.FloorLocked = true;
+            entry.Samples = Math.Max(1, entry.Samples);
+            entry.LastUpdatedUtc = DateTime.UtcNow;
+        }
+
+        Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
+
+        autotdpLock.Enter();
+        try
+        {
+            if (!string.IsNullOrEmpty(AutoTDPSessionId) && string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal) && ReferenceEquals(profile, AutoTDPSessionProfile))
+            {
+                autoTDPBaseline ??= new AutoTDPBaseline();
+                autoTDPBaseline.MinWatts = min;
+                autoTDPBaseline.MaxWatts = max;
+                autoTDPBaseline.RecentWatts = recent;
+                autoTDPBaseline.TypicalWatts = recent;
+                autoTDPBaseline.FloorLocked = true;
+                autoTDPBaseline.Samples = Math.Max(1, autoTDPBaseline.Samples);
+                AutoTDPBaselineDirty = false;
+
+                AutoTDPFloorW = min;
+                AutoTDPRangeMinW = min;
+                AutoTDPRangeMaxW = max;
+                AutoTDPProbeFailures = AUTOTDP_PROBE_MAX_FAILURES;
+                AutoTDPProbeBackoffSec = 0;
+                AutoTDPFloorRevalidated = false;
+                AutoTDPWarm = true;
+                if (AutoTDP < min)
+                    AutoTDP = min;
+
+                LogManager.LogInformation("AutoTDP baseline set manually for the running session: {0}-{1} W, baseline {2} W", min, max, recent);
+            }
+        }
+        finally
+        {
+            autotdpLock.Exit();
+        }
+
+        AutoTDPBaselinesChanged?.Invoke(profile);
+    }
+
+    /// <summary>Removes one learned baseline from a game profile; the running session (if it is that entry) starts learning again.</summary>
+    public static void RemoveAutoTDPBaseline(Profile profile, string key)
+    {
+        if (profile is null || string.IsNullOrEmpty(key))
+            return;
+
+        bool removed;
+        lock (profile.SyncRoot)
+            removed = profile.AutoTDPBaselines.Remove(key);
+
+        if (!removed)
+            return;
+
+        Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
+
+        if (!string.IsNullOrEmpty(AutoTDPSessionId) && string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal) && ReferenceEquals(profile, AutoTDPSessionProfile))
+            RelearnAutoTDP();
+
+        AutoTDPBaselinesChanged?.Invoke(profile);
+    }
+
+    /// <summary>
     ///     Discards the learned baseline for the current game/configuration and restarts learning from the
     ///     session maximum. Bound to the Relearn button on the quick performance page.
     /// </summary>
@@ -850,6 +936,25 @@ public static class PerformanceManager
 
         AutoTDPResetTelemetry();
         AutoTDPResetDwell();
+        bool resumed = AutoTDPStartFromBaseline(key);
+
+        bool hooked = PlatformManager.RTSS?.HasHook() ?? false;
+        if (!hooked)
+            RestoreTDP(true);
+
+        LogManager.LogInformation("AutoTDP session started: key={0}, seed={1} W, max={2} W, warm={3}, resumed={4}, baseline={5}", key, AutoTDP, AutoTDPMax, AutoTDPWarm, resumed,
+            autoTDPBaseline is null ? "none" : $"recent {autoTDPBaseline.RecentWatts} W, {autoTDPBaseline.MinWatts}-{autoTDPBaseline.MaxWatts} W, floor {(autoTDPBaseline.FloorLocked ? "locked" : "open")}");
+        AutoTDPTrace(AutoTDPNowSec, resumed ? "session-resume" : "session-start");
+        AutoTDPPublish(hooked ? (AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning) : AutoTDPState.NoTelemetry, AutoTDPNowSec, true);
+    }
+
+    /// <summary>
+    ///     Loads the baseline for <paramref name="key"/>, seeds the setpoint from it (or the ceiling), and lets a
+    ///     short-gap resume point override the seed with where the game left off. Used by a fresh session and by a
+    ///     nameless session that adopts its executable on hook, so both start from what was learned.
+    /// </summary>
+    private static bool AutoTDPStartFromBaseline(string key)
+    {
         AutoTDPLoadBaseline(key);
         AutoTDPSeedFromBaseline();
 
@@ -874,13 +979,8 @@ public static class PerformanceManager
             AutoTDPFloorW = resume.Floor;
         }
 
-        bool hooked = PlatformManager.RTSS?.HasHook() ?? false;
-        if (!hooked)
-            RestoreTDP(true);
-
-        LogManager.LogInformation("AutoTDP session started: key={0}, seed={1} W, max={2} W, warm={3}, resumed={4}", key, AutoTDP, AutoTDPMax, AutoTDPWarm, resumed);
-        AutoTDPTrace(AutoTDPNowSec, resumed ? "session-resume" : "session-start");
-        AutoTDPPublish(hooked ? (AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning) : AutoTDPState.NoTelemetry, AutoTDPNowSec, true);
+        AutoTDPApplied = 0; // the seed is written on the next tick
+        return resumed;
     }
 
     private static void AutoTDPRetarget(string key, float targetFps)
@@ -1005,22 +1105,18 @@ public static class PerformanceManager
             AutoTDPApplied = 0;
             AutoTDPLastWriteSec = 0;
 
-            // a session that started before the game was known adopts the hooked executable in place, keeping what it learned
+            // a session that started before the game was known (default profile, RTSS not hooked yet) adopts the hooked
+            // executable and starts over from that game's learned baseline - nothing worth keeping was learned yet
             if (string.IsNullOrEmpty(AutoTDPSessionExecutable) && currentProfile is not null && !string.IsNullOrEmpty(appEntry?.Name))
             {
                 AutoTDPSessionExecutable = Path.GetFileName(appEntry.Name);
                 string sessionId = AutoTDPBuildSessionId(currentProfile, AutoTDPSessionExecutable);
                 string key = AutoTDPBuildKey(sessionId, (float)AutoTDPTargetFPS);
 
-                double rangeMin = AutoTDPRangeMinW, rangeMax = AutoTDPRangeMaxW, floor = AutoTDPFloorW;
                 AutoTDPSessionId = sessionId;
-                AutoTDPRetarget(key, (float)AutoTDPTargetFPS);
-                if (autoTDPBaseline is null)
-                {
-                    AutoTDPRangeMinW = rangeMin;
-                    AutoTDPRangeMaxW = rangeMax;
-                    AutoTDPFloorW = floor;
-                }
+                bool resumed = AutoTDPStartFromBaseline(key);
+                LogManager.LogInformation("AutoTDP session adopted {0}: key={1}, seed={2} W, warm={3}, resumed={4}", AutoTDPSessionExecutable, key, AutoTDP, AutoTDPWarm, resumed);
+                AutoTDPPublish(AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning, AutoTDPNowSec, true);
             }
         }
         finally
@@ -1675,8 +1771,6 @@ public static class PerformanceManager
     {
         string source = string.Join(";",
             ManagerFactory.settingsManager.GetInt("ConfigurableTDPMethod"),
-            TDPMin.ToString(CultureInfo.InvariantCulture),
-            TDPMax.ToString(CultureInfo.InvariantCulture),
             profile.CPUOverrideEnabled, profile.CPUOverrideValue.ToString(CultureInfo.InvariantCulture),
             profile.GPUOverrideEnabled, profile.GPUOverrideValue.ToString(CultureInfo.InvariantCulture),
             (int)profile.CPUBoostLevel,
@@ -1773,6 +1867,7 @@ public static class PerformanceManager
         Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
         AutoTDPBaselineDirty = false;
         AutoTDPBaselineSavedSec = now;
+        AutoTDPBaselinesChanged?.Invoke(profile);
     }
 
     #endregion
@@ -2900,6 +2995,10 @@ public static class PerformanceManager
     /// <summary>Raised when the AutoTDP state, applied wattage or capped flag changes (not on every sample). May fire on a threadpool thread.</summary>
     public static event AutoTDPStatusChangedEventHandler? AutoTDPStatusChanged;
     public delegate void AutoTDPStatusChangedEventHandler(AutoTDPStatus status);
+
+    /// <summary>Raised when a game profile's learned AutoTDP baselines were written (learning, session end, manual edit). May fire on a threadpool thread.</summary>
+    public static event AutoTDPBaselinesChangedEventHandler? AutoTDPBaselinesChanged;
+    public delegate void AutoTDPBaselinesChangedEventHandler(Profile profile);
 
     #endregion
 }

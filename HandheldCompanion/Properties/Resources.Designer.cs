@@ -9039,6 +9039,114 @@ namespace HandheldCompanion.Properties {
         }
 
         /// <summary>
+        ///   Looks up a localized string similar to Automatic TDP.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPSection {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPSection", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Learned baselines.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselines {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselines", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to What AutoTDP has learned for this game per power preset, power source and frame target. Adjust the floor (never below), the baseline it starts from and the heavy-scene maximum, or remove an entry to learn it again..
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselinesDesc {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselinesDesc", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Floor (W).
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineMin {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineMin", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Baseline (W).
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineValue {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineValue", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Max (W).
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineMax {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineMax", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Forget this baseline.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineRemove {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineRemove", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to On battery.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineBattery {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineBattery", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Plugged in.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselinePlugged {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselinePlugged", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to floor established.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineFloorLocked {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineFloorLocked", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to floor still learning.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineFloorOpen {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineFloorOpen", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Learned {0} · {1} · {2} session(s).
+        /// </summary>
+        public static string ProfilesPage_AutoTDPBaselineEntryDesc {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPBaselineEntryDesc", resourceCulture);
+            }
+        }
+
+        /// <summary>
         ///   Looks up a localized string similar to Relearn.
         /// </summary>
         public static string ProfilesPage_AutoTDPRelearn {

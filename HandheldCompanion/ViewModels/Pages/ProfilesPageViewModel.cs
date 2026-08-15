@@ -64,6 +64,7 @@ namespace HandheldCompanion.ViewModels
 
         public ObservableCollection<LibraryEntryViewModel> LibraryPickers { get; } = [];
         public ObservableCollection<WindowListItemViewModel> AllWindows { get; } = [];
+        public ObservableCollection<AutoTDPBaselineViewModel> AutoTDPBaselines { get; } = [];
         public ObservableCollection<HotkeyViewModel> HotkeysList { get; set; } = [];
 
         // ComboBox collections
@@ -74,6 +75,7 @@ namespace HandheldCompanion.ViewModels
         public ObservableCollection<MotionInputViewModel> MotionInputModes { get; } = [];
 
         public bool HasAnyWindows => AllWindows.Any();
+        public bool HasAutoTDPBaselines => AutoTDPBaselines.Any();
 
         // True if library search results are available in LibraryPickers (for enabling ComboBox and showing preview)
         public bool HasLibraryEntry => LibraryPickers.Any();
@@ -1879,6 +1881,8 @@ namespace HandheldCompanion.ViewModels
             BindingOperations.EnableCollectionSynchronization(SubProfiles, _collectionLock5);
             BindingOperations.EnableCollectionSynchronization(IntegerScalingDividers, _collectionLock6);
             BindingOperations.EnableCollectionSynchronization(AllWindows, _collectionLock7);
+            BindingOperations.EnableCollectionSynchronization(AutoTDPBaselines, _collectionLock8);
+            PerformanceManager.AutoTDPBaselinesChanged += PerformanceManager_AutoTDPBaselinesChanged;
 
             ProfilePickerCollectionViewDC = new ListCollectionView(ProfilePicker);
             ProfilePickerCollectionViewDC.GroupDescriptions.Add(new PropertyGroupDescription("Header"));
@@ -3012,6 +3016,8 @@ namespace HandheldCompanion.ViewModels
 
             OnPropertyChanged(nameof(HasAnyWindows));
 
+            RefreshAutoTDPBaselines();
+
             selectedProcess = null;
             if (SelectedProfile != null)
             {
@@ -3034,6 +3040,38 @@ namespace HandheldCompanion.ViewModels
             RefreshProfileExecutables();
 
             UpdateUI();
+        }
+
+        /// <summary>
+        /// Rebuilds the learned AutoTDP baselines list from SelectedProfile.AutoTDPBaselines (newest first).
+        /// Called when the profile changes and whenever PerformanceManager writes baselines for it.
+        /// </summary>
+        private void RefreshAutoTDPBaselines()
+        {
+            lock (_collectionLock8)
+            {
+                AutoTDPBaselines.Clear();
+                Profile? profile = SelectedProfile;
+                if (profile != null)
+                {
+                    List<KeyValuePair<string, AutoTDPBaseline>> entries;
+                    lock (profile.SyncRoot)
+                        entries = profile.AutoTDPBaselines.OrderByDescending(kv => kv.Value.LastUpdatedUtc).ToList();
+
+                    foreach (KeyValuePair<string, AutoTDPBaseline> kv in entries)
+                        AutoTDPBaselines.Add(new AutoTDPBaselineViewModel(profile, kv.Key, kv.Value));
+                }
+            }
+
+            OnPropertyChanged(nameof(HasAutoTDPBaselines));
+        }
+
+        private void PerformanceManager_AutoTDPBaselinesChanged(Profile profile)
+        {
+            if (SelectedProfile is null || profile.Guid != SelectedProfile.Guid)
+                return;
+
+            RefreshAutoTDPBaselines();
         }
 
         /// <summary>
@@ -3633,6 +3671,7 @@ namespace HandheldCompanion.ViewModels
                 ManagerFactory.profileManager.Updated -= ProfileUpdated;
                 ManagerFactory.profileManager.Applied -= ProfileApplied;
                 ManagerFactory.profileManager.Initialized -= ProfileManager_Initialized;
+                PerformanceManager.AutoTDPBaselinesChanged -= PerformanceManager_AutoTDPBaselinesChanged;
 
                 if (IsQuickTools)
                 {

@@ -19,6 +19,7 @@ namespace HandheldCompanion.ViewModels
         protected readonly object _collectionLock5 = new object();
         protected readonly object _collectionLock6 = new object();
         protected readonly object _collectionLock7 = new object();
+        protected readonly object _collectionLock8 = new object();
 
         ~BaseViewModel()
         {

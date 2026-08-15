@@ -995,6 +995,85 @@
                     </ikw:SimpleStackPanel>
                 </ikw:SimpleStackPanel>
 
+                <!--  AutoTDP  -->
+                <ikw:SimpleStackPanel Spacing="8" Visibility="{Binding PerformanceManagerEnabled, Mode=OneWay, UpdateSourceTrigger=PropertyChanged, Converter={StaticResource BooleanToVisibilityConverter}}">
+                    <TextBlock Style="{StaticResource BaseTextBlockStyle}" Text="{l:Static resx:Resources.ProfilesPage_AutoTDPSection}" />
+                    <ikw:SimpleStackPanel Spacing="3">
+                        <ui:SettingsExpander
+                            Description="{l:Static resx:Resources.ProfilesPage_AutoTDPBaselinesDesc}"
+                            Header="{l:Static resx:Resources.ProfilesPage_AutoTDPBaselines}"
+                            IsEnabled="{Binding HasAutoTDPBaselines, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}"
+                            IsExpanded="{Binding HasAutoTDPBaselines, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}"
+                            ItemsSource="{Binding AutoTDPBaselines}">
+
+                            <ui:SettingsExpander.HeaderIcon>
+                                <ui:FontIcon Glyph="&#xea86;" />
+                            </ui:SettingsExpander.HeaderIcon>
+
+                            <ui:SettingsExpander.ItemTemplate>
+                                <DataTemplate>
+                                    <ui:SettingsCard Description="{Binding Description, Mode=OneWay}" Header="{Binding Header, Mode=OneWay}">
+                                        <ikw:SimpleStackPanel
+                                            HorizontalAlignment="Right"
+                                            Orientation="Horizontal"
+                                            Spacing="6">
+
+                                            <!--  Floor (hard minimum)  -->
+                                            <ikw:SimpleStackPanel Spacing="2">
+                                                <TextBlock
+                                                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                    Style="{StaticResource CaptionTextBlockStyle}"
+                                                    Text="{l:Static resx:Resources.ProfilesPage_AutoTDPBaselineMin}" />
+                                                <ui:NumberBox
+                                                    MinWidth="110"
+                                                    Maximum="{Binding MaximumWatts, Mode=OneWay}"
+                                                    Minimum="{Binding MinimumWatts, Mode=OneWay}"
+                                                    SpinButtonPlacementMode="Inline"
+                                                    Value="{Binding MinWatts, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </ikw:SimpleStackPanel>
+
+                                            <!--  Baseline (session seed)  -->
+                                            <ikw:SimpleStackPanel Spacing="2">
+                                                <TextBlock
+                                                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                    Style="{StaticResource CaptionTextBlockStyle}"
+                                                    Text="{l:Static resx:Resources.ProfilesPage_AutoTDPBaselineValue}" />
+                                                <ui:NumberBox
+                                                    MinWidth="110"
+                                                    Maximum="{Binding MaximumWatts, Mode=OneWay}"
+                                                    Minimum="{Binding MinimumWatts, Mode=OneWay}"
+                                                    SpinButtonPlacementMode="Inline"
+                                                    Value="{Binding BaselineWatts, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </ikw:SimpleStackPanel>
+
+                                            <!--  Max (heavy scenes)  -->
+                                            <ikw:SimpleStackPanel Spacing="2">
+                                                <TextBlock
+                                                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                    Style="{StaticResource CaptionTextBlockStyle}"
+                                                    Text="{l:Static resx:Resources.ProfilesPage_AutoTDPBaselineMax}" />
+                                                <ui:NumberBox
+                                                    MinWidth="110"
+                                                    Maximum="{Binding MaximumWatts, Mode=OneWay}"
+                                                    Minimum="{Binding MinimumWatts, Mode=OneWay}"
+                                                    SpinButtonPlacementMode="Inline"
+                                                    Value="{Binding MaxWatts, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </ikw:SimpleStackPanel>
+
+                                            <Button
+                                                VerticalAlignment="Bottom"
+                                                Command="{Binding RemoveCommand}"
+                                                ToolTip="{l:Static resx:Resources.ProfilesPage_AutoTDPBaselineRemove}">
+                                                <ui:FontIcon FontFamily="{DynamicResource SymbolThemeFontFamily}" Glyph="&#xe738;" />
+                                            </Button>
+                                        </ikw:SimpleStackPanel>
+                                    </ui:SettingsCard>
+                                </DataTemplate>
+                            </ui:SettingsExpander.ItemTemplate>
+                        </ui:SettingsExpander>
+                    </ikw:SimpleStackPanel>
+                </ikw:SimpleStackPanel>
+
                 <!--  Graphics settings  -->
                 <ikw:SimpleStackPanel Spacing="8">
                     <TextBlock
