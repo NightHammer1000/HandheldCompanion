@@ -100,7 +100,7 @@ public static class PerformanceManager
     private const double AUTOTDP_TAIL_CLEAN_RATIO = 1.02;          // p95 frametime at or below target x this => tail is immaculate
     private const double AUTOTDP_UP_SETTLE_SEC = 1.0;              // minimum spacing between consecutive up-steps
     private const int AUTOTDP_UP_STEP_W = 1;                       // up-step on a tail-only deficit
-    private const int AUTOTDP_UP_STEP_SHORTFALL_W = 2;             // up-step when the mean fps is clearly short as well
+    private const int AUTOTDP_UP_STEP_SHORTFALL_W = 1;             // up-step when the mean fps is clearly short as well (kept at 1 W: larger recovery steps overshoot on device)
     private const double AUTOTDP_DOWN_DWELL_INRANGE_SEC = 5.0;     // sustained headroom required before stepping down inside the known range
     private const double AUTOTDP_DOWN_SETTLE_INRANGE_SEC = 3.0;    // spacing between down-steps inside the known range
     private const double AUTOTDP_PROBE_DWELL_SEC = 15.0;           // sustained headroom required before probing below the known floor
@@ -120,7 +120,7 @@ public static class PerformanceManager
     private const double AUTOTDP_CAP_STICKY_SEC = 30.0;            // behavioural cap detection stays latched for this long
     private const double AUTOTDP_WRITE_SPACING_SEC = 1.0;          // minimum spacing between hardware writes
     private const int AUTOTDP_MAX_STEP_W = 2;                      // maximum change per write, except a jump back to a validated hold level
-    private const int AUTOTDP_MAX_JUMP_W = 4;                      // maximum jump back to the last validated hold level
+    private const int AUTOTDP_MAX_JUMP_W = 4;                      // maximum single write when returning to the level a failed descent step came from
     private const double AUTOTDP_HOLD_VALIDATE_SEC = 5.0;          // hold this long without deficit to remember the level as validated
     private const double AUTOTDP_CONVERGE_SEC = 20.0;              // hold this long at one applied level to converge (Learning -> Tracking)
     private const double AUTOTDP_MAXLIMITED_SEC = 3.0;             // deficit while pinned at max for this long => MaxLimited
@@ -1311,13 +1311,9 @@ public static class PerformanceManager
             }
             else if (now >= AutoTDPUpSettleUntilSec)
             {
-                if (powerDeficit && AutoTDPRangeMaxW > applied)
-                {
-                    // a heavier scene we have already handled this session: jump toward its level (bounded)
-                    AutoTDP = Math.Min(AutoTDPRangeMaxW, applied + AUTOTDP_MAX_JUMP_W);
-                    reason = "jump";
-                }
-                else if (powerDeficit)
+                // recovery is one watt per settle, two only when the mean itself is clearly short; a jump toward the
+                // session's heavy level was tried and overshoots far more than it saves (device feedback)
+                if (powerDeficit)
                 {
                     AutoTDP = applied + (shortfall ? AUTOTDP_UP_STEP_SHORTFALL_W : AUTOTDP_UP_STEP_W);
                     reason = shortfall ? "up-shortfall" : "up";
@@ -1430,7 +1426,7 @@ public static class PerformanceManager
         if (AutoTDPApplied > 0)
         {
             double delta = candidate - AutoTDPApplied;
-            double maxUp = reason == "jump" || reason == "down-fail" ? AUTOTDP_MAX_JUMP_W : AUTOTDP_MAX_STEP_W;
+            double maxUp = reason == "down-fail" ? AUTOTDP_MAX_JUMP_W : AUTOTDP_MAX_STEP_W;
             delta = Math.Clamp(delta, -AUTOTDP_MAX_STEP_DOWN_W, maxUp);
             candidate = AutoTDPApplied + delta;
         }
