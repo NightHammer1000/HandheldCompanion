@@ -1054,6 +1054,18 @@ namespace HandheldCompanion.Properties
                 this["OnScreenDisplayBATTLevel"] = value;
             }
         }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("1")]
+        public int OnScreenDisplayAutoTDPLevel {
+            get {
+                return ((int)(this["OnScreenDisplayAutoTDPLevel"]));
+            }
+            set {
+                this["OnScreenDisplayAutoTDPLevel"] = value;
+            }
+        }
         
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]

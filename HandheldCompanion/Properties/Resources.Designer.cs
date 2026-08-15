@@ -7228,7 +7228,25 @@ namespace HandheldCompanion.Properties {
                 return ResourceManager.GetString("OverlayPage_BATTLevelDesc", resourceCulture);
             }
         }
-        
+
+        /// <summary>
+        ///   Looks up a localized string similar to Automatic TDP Level.
+        /// </summary>
+        public static string OverlayPage_AutoTDPLevel {
+            get {
+                return ResourceManager.GetString("OverlayPage_AutoTDPLevel", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to The level of information for the automatic TDP controller..
+        /// </summary>
+        public static string OverlayPage_AutoTDPLevelDesc {
+            get {
+                return ResourceManager.GetString("OverlayPage_AutoTDPLevelDesc", resourceCulture);
+            }
+        }
+
         /// <summary>
         ///   Looks up a localized string similar to Face camera.
         /// </summary>

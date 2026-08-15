@@ -30,6 +30,7 @@ public static class Settings
     public static readonly string OnScreenDisplayRAMLevel = "OnScreenDisplayRAMLevel";
     public static readonly string OnScreenDisplayVRAMLevel = "OnScreenDisplayVRAMLevel";
     public static readonly string OnScreenDisplayBATTLevel = "OnScreenDisplayBATTLevel";
+    public static readonly string OnScreenDisplayAutoTDPLevel = "OnScreenDisplayAutoTDPLevel";
 
     /// <summary>
     /// First version that implemented the new Hotkey manager

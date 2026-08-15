@@ -85,6 +85,7 @@ public partial class OverlayPage : Page
         SettingsManager_SettingValueChanged("OnScreenDisplayRAMLevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayRAMLevel"), false, false);
         SettingsManager_SettingValueChanged("OnScreenDisplayVRAMLevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayVRAMLevel"), false, false);
         SettingsManager_SettingValueChanged("OnScreenDisplayBATTLevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayBATTLevel"), false, false);
+        SettingsManager_SettingValueChanged("OnScreenDisplayAutoTDPLevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayAutoTDPLevel"), false, false);
     }
 
     private void QueryPlatforms()
@@ -199,6 +200,9 @@ public partial class OverlayPage : Page
                     break;
                 case "OnScreenDisplayBATTLevel":
                     ComboBoxOnScreenDisplayBATTLevel.SelectedIndex = Convert.ToInt32(value);
+                    break;
+                case "OnScreenDisplayAutoTDPLevel":
+                    ComboBoxOnScreenDisplayAutoTDPLevel.SelectedIndex = Convert.ToInt32(value);
                     break;
             }
         });
@@ -423,5 +427,13 @@ public partial class OverlayPage : Page
             return;
 
         ManagerFactory.settingsManager.SetProperty("OnScreenDisplayBATTLevel", ((ComboBox)sender).SelectedIndex);
+    }
+
+    private void ComboBoxOnScreenDisplayAutoTDPLevel_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded)
+            return;
+
+        ManagerFactory.settingsManager.SetProperty("OnScreenDisplayAutoTDPLevel", ((ComboBox)sender).SelectedIndex);
     }
 }

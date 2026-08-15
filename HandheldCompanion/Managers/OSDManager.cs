@@ -6,6 +6,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Timers;
 
 namespace HandheldCompanion.Managers;
@@ -34,6 +35,7 @@ public static class OSDManager
     public static short OverlayGPULevel;
     public static short OverlayVRAMLevel;
     public static short OverlayBATTLevel;
+    public static short OverlayAutoTDPLevel;
 
     private static readonly Timer RefreshTimer;
     private static int RefreshInterval = 100;
@@ -124,6 +126,7 @@ public static class OSDManager
         SettingsManager_SettingValueChanged("OnScreenDisplayGPULevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayGPULevel"), false, false);
         SettingsManager_SettingValueChanged("OnScreenDisplayVRAMLevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayVRAMLevel"), false, false);
         SettingsManager_SettingValueChanged("OnScreenDisplayBATTLevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayBATTLevel"), false, false);
+        SettingsManager_SettingValueChanged("OnScreenDisplayAutoTDPLevel", ManagerFactory.settingsManager.GetString("OnScreenDisplayAutoTDPLevel"), false, false);
     }
 
     public static void Stop()
@@ -308,8 +311,25 @@ public static class OSDManager
                 break;
 
             case "OnScreenDisplayOrder":
-                OverlayOrder = Convert.ToString(value)?.Split(",") ?? new string[0];
-                OverlayCount = OverlayOrder.Length;
+                {
+                    // the order is user-authored: normalise widget names and make sure widgets added later (AutoTDP)
+                    // are reachable for existing installations that already persisted the old default
+                    string[] order = (Convert.ToString(value) ?? string.Empty)
+                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Select(name => name.ToUpperInvariant())
+                        .Distinct()
+                        .ToArray();
+
+                    if (!order.Contains("AUTOTDP"))
+                        order = order.Append("AUTOTDP").ToArray();
+
+                    OverlayOrder = order;
+                    OverlayCount = OverlayOrder.Length;
+
+                    string normalized = string.Join(",", order);
+                    if (!initializing && !string.Equals(normalized, Convert.ToString(value), StringComparison.Ordinal))
+                        ManagerFactory.settingsManager.SetProperty("OnScreenDisplayOrder", normalized);
+                }
                 break;
             case "OnScreenDisplayTimeLevel":
                 OverlayTimeLevel = Convert.ToInt16(value);
@@ -332,6 +352,9 @@ public static class OSDManager
             case "OnScreenDisplayBATTLevel":
                 OverlayBATTLevel = Convert.ToInt16(value);
                 break;
+            case "OnScreenDisplayAutoTDPLevel":
+                OverlayAutoTDPLevel = Convert.ToInt16(value);
+                break;
         }
     }
 }
@@ -341,27 +364,45 @@ public struct OverlayEntryElement
     public string Value { get; set; }
     public string SzUnit { get; set; }
 
+    /// <summary>
+    ///     Optional RRGGBB colour for this element. When empty the element renders in the shared value colour slot
+    ///     (<c>C0</c>); when set it renders in its own colour, e.g. for state indicators.
+    /// </summary>
+    public string Color { get; set; }
+
     public override string ToString()
     {
-        return string.Format("<C0>{0:00}<S1>{1}<S><C>", Value, SzUnit);
+        return string.IsNullOrEmpty(Color)
+            ? string.Format("<C0>{0}<S1>{1}<S><C>", Value, SzUnit)
+            : string.Format("<C={0}>{1}<S1>{2}<S><C>", Color, Value, SzUnit);
     }
 
     public OverlayEntryElement(float value, string unit)
     {
         Value = FormatValue(value, unit);
         SzUnit = unit;
+        Color = string.Empty;
     }
 
     public OverlayEntryElement(float value, float available, string unit)
     {
         Value = FormatValue(value, unit) + "/" + FormatValue(available, unit);
         SzUnit = unit;
+        Color = string.Empty;
     }
 
     public OverlayEntryElement(string value, string unit = "")
     {
         Value = value;
         SzUnit = unit;
+        Color = string.Empty;
+    }
+
+    public OverlayEntryElement(string value, string unit, string color)
+    {
+        Value = value;
+        SzUnit = unit;
+        Color = color;
     }
 
     private static string FormatValue(float value, string unit)

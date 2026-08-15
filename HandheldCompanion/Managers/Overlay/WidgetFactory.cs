@@ -13,7 +13,8 @@ public class WidgetFactory
         {"CPU", new CpuWidget()},
         {"RAM", new RamWidget()},
         {"FPS", new FPSWidget()},
-        {"GPU", new GpuWidget()}
+        {"GPU", new GpuWidget()},
+        {"AUTOTDP", new AutoTDPWidget()}
     };
 
     /// <summary>

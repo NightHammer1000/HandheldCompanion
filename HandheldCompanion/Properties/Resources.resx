@@ -1521,6 +1521,12 @@ Motion input toggle: press selected button(s) to switch motion state.</value>
   <data name="OverlayPage_BATTLevelDesc" xml:space="preserve">
     <value>The level of information for your battery.</value>
   </data>
+  <data name="OverlayPage_AutoTDPLevel" xml:space="preserve">
+    <value>Automatic TDP Level</value>
+  </data>
+  <data name="OverlayPage_AutoTDPLevelDesc" xml:space="preserve">
+    <value>The level of information for the automatic TDP controller.</value>
+  </data>
   <data name="ProfilesPage_ControllerLayoutDesc" xml:space="preserve">
     <value>Change how buttons, sticks, triggers, and gyro translate into in-game actions</value>
   </data>

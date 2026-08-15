@@ -1,3 +1,5 @@
+using System.Linq;
+
 namespace HandheldCompanion.Managers.Overlay.Strategy;
 
 
@@ -11,6 +13,7 @@ public class FullStrategy : IOverlayStrategy
         OverlayRow row4 = new(); // VRAM
         OverlayRow row5 = new(); // Battery
         OverlayRow row6 = new(); // FPS
+        OverlayRow row7 = new(); // AutoTDP
 
         OverlayEntry GPUentry = new("GPU", OverlayColors.GPU_COLOR, true);
         WidgetFactory.CreateWidget("GPU", GPUentry, WidgetLevel.FULL);
@@ -36,13 +39,24 @@ public class FullStrategy : IOverlayStrategy
         WidgetFactory.CreateWidget("FPS", fpsEntry, WidgetLevel.FULL);
         row6.entries.Add(fpsEntry);
 
+        OverlayEntry AutoTDPentry = new("TDP", OverlayColors.AUTOTDP_COLOR, true);
+        WidgetFactory.CreateWidget("AUTOTDP", AutoTDPentry, WidgetLevel.FULL);
+        row7.entries.Add(AutoTDPentry);
+
+        // an empty AutoTDP row (controller disabled) renders as an empty string; drop it to avoid a blank line
+        string autoTDPRow = row7.ToString();
+
         return string.Join("\n",
-            row1.ToString(),
-            row2.ToString(),
-            row3.ToString(),
-            row4.ToString(),
-            row5.ToString(),
-            row6.ToString()
+            new[]
+            {
+                row1.ToString(),
+                row2.ToString(),
+                row3.ToString(),
+                row4.ToString(),
+                row5.ToString(),
+                row6.ToString(),
+                autoTDPRow
+            }.Where(row => !string.IsNullOrEmpty(row))
         );
     }
 }

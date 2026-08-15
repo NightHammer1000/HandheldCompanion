@@ -29,6 +29,10 @@ public class ExtendedStrategy : IOverlayStrategy
         WidgetFactory.CreateWidget("BATT", BATTentry, WidgetLevel.MINIMAL);
         row1.entries.Add(BATTentry);
 
+        OverlayEntry AutoTDPentry = new("TDP", OverlayColors.AUTOTDP_COLOR);
+        WidgetFactory.CreateWidget("AUTOTDP", AutoTDPentry, WidgetLevel.MINIMAL);
+        row1.entries.Add(AutoTDPentry);
+
         return row1.ToString();
     }
 }

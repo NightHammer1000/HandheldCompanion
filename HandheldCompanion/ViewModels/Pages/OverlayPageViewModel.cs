@@ -181,6 +181,22 @@ namespace HandheldCompanion.ViewModels
             }
         }
 
+        private int _onScreenDisplayAutoTDPLevel;
+        public int OnScreenDisplayAutoTDPLevel
+        {
+            get => _onScreenDisplayAutoTDPLevel;
+            set
+            {
+                if (value != OnScreenDisplayAutoTDPLevel)
+                {
+                    _onScreenDisplayAutoTDPLevel = value;
+                    OnPropertyChanged(nameof(OnScreenDisplayAutoTDPLevel));
+
+                    ManagerFactory.settingsManager.SetProperty(Settings.OnScreenDisplayAutoTDPLevel, value);
+                }
+            }
+        }
+
         private float _CPUPower;
         public float CPUPower
         {
@@ -526,6 +542,7 @@ namespace HandheldCompanion.ViewModels
             SettingsManager_SettingValueChanged(Settings.OnScreenDisplayRAMLevel, ManagerFactory.settingsManager.GetInt(Settings.OnScreenDisplayRAMLevel), false, false);
             SettingsManager_SettingValueChanged(Settings.OnScreenDisplayVRAMLevel, ManagerFactory.settingsManager.GetInt(Settings.OnScreenDisplayVRAMLevel), false, false);
             SettingsManager_SettingValueChanged(Settings.OnScreenDisplayBATTLevel, ManagerFactory.settingsManager.GetInt(Settings.OnScreenDisplayBATTLevel), false, false);
+            SettingsManager_SettingValueChanged(Settings.OnScreenDisplayAutoTDPLevel, ManagerFactory.settingsManager.GetInt(Settings.OnScreenDisplayAutoTDPLevel), false, false);
         }
 
         private void QueryGPU()
@@ -795,6 +812,8 @@ namespace HandheldCompanion.ViewModels
                 _onScreenDisplayVRAMLevel = Convert.ToInt32(value);
             else if (name == Settings.OnScreenDisplayBATTLevel)
                 _onScreenDisplayBATTLevel = Convert.ToInt32(value);
+            else if (name == Settings.OnScreenDisplayAutoTDPLevel)
+                _onScreenDisplayAutoTDPLevel = Convert.ToInt32(value);
 
             OnPropertyChanged(name); // setting names matches property name
         }

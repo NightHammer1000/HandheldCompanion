@@ -202,6 +202,21 @@
                                     <ComboBoxItem Content="{l:Static resx:Resources.OverlayPage_OverlayDisplayCustomLevel_Full}" />
                                 </ComboBox>
                             </ui:SettingsCard>
+
+                            <ui:SettingsCard
+                                Description="{l:Static resx:Resources.OverlayPage_AutoTDPLevelDesc}"
+                                Header="{l:Static resx:Resources.OverlayPage_AutoTDPLevel}"
+                                IsEnabled="{Binding IsCustomOnScreenDisplayLevelEnabled}">
+                                <ComboBox
+                                    Name="ComboBoxOnScreenDisplayAutoTDPLevel"
+                                    HorizontalAlignment="Stretch"
+                                    IsReadOnly="True"
+                                    SelectionChanged="ComboBoxOnScreenDisplayAutoTDPLevel_SelectionChanged">
+                                    <ComboBoxItem Content="{l:Static resx:Resources.OverlayPage_OverlayDisplayCustomLevel_Disabled}" />
+                                    <ComboBoxItem Content="{l:Static resx:Resources.OverlayPage_OverlayDisplayCustomLevel_Minimal}" />
+                                    <ComboBoxItem Content="{l:Static resx:Resources.OverlayPage_OverlayDisplayCustomLevel_Full}" />
+                                </ComboBox>
+                            </ui:SettingsCard>
                         </ui:SettingsExpander.Items>
                     </ui:SettingsExpander>
                 </ikw:SimpleStackPanel>
