@@ -14,7 +14,11 @@ namespace HandheldCompanion.Misc
         /// <summary>Slow EWMA of converged hold levels across sessions.</summary>
         public double TypicalWatts { get; set; }
 
-        /// <summary>Hold level at the most recent convergence or session end.</summary>
+        /// <summary>
+        ///     The baseline: the hold level at the most recent convergence or session end while the range is still
+        ///     open; once <see cref="FloorLocked"/> and the range is known, the middle of the range biased to the floor
+        ///     (min + a quarter of the span). Seeds later sessions (see <see cref="GetSeedWatts"/>).
+        /// </summary>
         public double RecentWatts { get; set; }
 
         /// <summary>Lowest applied level that held the target (probe floor + 1).</summary>

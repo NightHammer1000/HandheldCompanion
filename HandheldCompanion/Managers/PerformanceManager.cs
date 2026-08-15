@@ -110,6 +110,9 @@ public static class PerformanceManager
     private const double AUTOTDP_PROBE_FAIL_WINDOW_SEC = 10.0;     // a deficit within this window after a probe marks the probe as failed
     private const double AUTOTDP_PROBE_BACKOFF_MAX_SEC = 300.0;    // exponential back-off cap for repeated failed probes
     private const int AUTOTDP_PROBE_MAX_FAILURES = 3;              // consecutive failed probes after which the floor is locked for the session
+    private const int AUTOTDP_STRIKE_BOOK_COUNT = 2;               // lone long frames right after descending to the same level, on separate attempts, before that level is booked as failed
+    private const double AUTOTDP_STRIKE_DWELL_SEC = 10.0;          // clean time required at the level above before a struck level is attempted again
+    private const int AUTOTDP_SCENE_CHANGE_W = 2;                  // a booked failure whose deficit only clears this far above the level stepped down from was a scene change, not the level
     private const double AUTOTDP_FLOOR_REVALIDATE_SEC = 300.0;     // quiet time before a learned (locked) floor is probed once more per session
     private const double AUTOTDP_FAST_DOWN_RATIO = 1.5;            // uncapped fps above target x this => 2 W down-steps, short dwell/settle
     private const double AUTOTDP_FASTER_DOWN_RATIO = 2.0;          // uncapped fps above target x this => 4 W down-steps
@@ -129,6 +132,7 @@ public static class PerformanceManager
     private const double AUTOTDP_TELEMETRY_STALE_SEC = 1.0;        // frame counter not advancing for this long => NoTelemetry
     private const double AUTOTDP_BASELINE_RESAVE_SEC = 60.0;       // minimum spacing between baseline re-serialisations while tracking
     private const double AUTOTDP_BASELINE_EWMA = 0.5;              // weight of the newest convergence in TypicalWatts
+    private const double AUTOTDP_BASELINE_RANGE_BIAS = 0.25;       // baseline = min + this x (max - min) once the range is complete (middle of the range, 50 % bias to the floor)
     private const int AUTOTDP_BASELINE_CAP = 16;                   // maximum baselines kept per game profile (LRU by LastUpdatedUtc)
     private const int AUTOTDP_FRAME_RING = 1024;                   // matches RTSS's shared-memory ring
 
@@ -186,13 +190,19 @@ public static class PerformanceManager
     private static double AutoTDPUpSettleUntilSec, AutoTDPDownSettleUntilSec;
     private static double AutoTDPRangeMinW, AutoTDPRangeMaxW;    // lowest level known to hold / heaviest level that cleared a deficit
     private static double AutoTDPFloorW;                          // lowest level known to hold; descending below it is a cautious probe
-    private static double AutoTDPLastDownSec, AutoTDPDownFromW;   // last down-step: when, and from which level
+    private static double AutoTDPLastDownSec, AutoTDPDownFromW, AutoTDPDownToW;   // last down-step: when, from which level, to which level
     private static bool AutoTDPDownWasProbe, AutoTDPInDeficit;
     private static double AutoTDPProbeBackoffSec;
     private static int AutoTDPProbeFailures;
     private static double AutoTDPConvergeSec, AutoTDPMaxLimitedSec;
     private static bool AutoTDPFloorRevalidated;                  // the learned floor's one revalidation probe has been spent this session
     private static double AutoTDPLastStutterStepSec;              // last time a stutter bought a watt
+    private static bool AutoTDPLongFrameActive;                   // the window currently holds a long frame (edge detection for strikes)
+    private static double AutoTDPStrikeW;                         // level that showed a lone long frame right after being stepped down to ...
+    private static int AutoTDPStrikeCount;                        // ... and on how many separate attempts; booked as failed at AUTOTDP_STRIKE_BOOK_COUNT
+    private static bool AutoTDPBookedPending;                     // a failure was booked for the deficit in progress; undone if the deficit turns out to be a scene change
+    private static double AutoTDPBookedDownFromW, AutoTDPBookedFloorPrev, AutoTDPBookedBackoffPrev;
+    private static int AutoTDPBookedFailuresPrev;
     private static double AutoTDPLastHoldValidW;                  // last level that held for AUTOTDP_HOLD_VALIDATE_SEC without deficit (folded into the baseline at session end)
     private static bool AutoTDPConvergedAtLevel;
     private static double AutoTDPPendingW;
@@ -1353,7 +1363,8 @@ public static class PerformanceManager
         // Two kinds of deficit. A *power* deficit is evidence the level cannot hold the target: the window mean is
         // short, or (near the target) the tail drifts. A *stutter* is one long frame in an otherwise fine window -
         // asset streaming, a hitch - it earns an immediate +1 W (cheap, reclaimed later) but says nothing about the
-        // level, so it never moves the floor, the back-off, the range or the MaxLimited state.
+        // level, so it never moves the range or the MaxLimited state, and moves the floor only when the same level
+        // is struck on separate attempts (strikes, below).
         //   Capped (limiter/VSync at the target): frametimes are flat, so any long frame is a stutter and p95 drift is
         //   a power deficit. Uncapped: frametimes jitter by design; the tail only counts while the mean sits near the
         //   target, and lone long frames at a mean far above the target are ignored entirely.
@@ -1373,6 +1384,8 @@ public static class PerformanceManager
         // before the first successful write the setpoint itself is the best estimate of the applied level
         double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
         bool recentDescent = AutoTDPLastDownSec > 0 && now - AutoTDPLastDownSec < AUTOTDP_PROBE_FAIL_WINDOW_SEC;
+        bool longFrameEvent = AutoTDPLongFrames > 0 && !AutoTDPLongFrameActive;
+        AutoTDPLongFrameActive = AutoTDPLongFrames > 0;
         string reason;
 
         AutoTDPInPowerDeficit = powerDeficit;
@@ -1390,22 +1403,45 @@ public static class PerformanceManager
             AutoTDPHoldSec = 0;
             AutoTDPDeficitSec += dt;
 
-            // With a limiter the frametimes are flat, so even one moderate long frame (not a storage hitch) right after
-            // a descent step is evidence against the new level: without this, a marginal level that drops a frame
-            // every couple of seconds is re-probed forever, one visible dip per attempt.
-            bool marginalAfterDescent = AutoTDPCapped && AutoTDPLongFrames >= 1 && AutoTDPSevereFrames == 0;
-
-            if (recentDescent && (powerDeficit || marginalAfterDescent))
+            // A lone long frame right after a descent step carries no level information on its own: menus, loading
+            // and asset streaming produce them at every level, and booking each one as "the level cannot hold" made
+            // the floor land wherever the game happened to hitch (traces: floors booked at 27-31 W in the menu for a
+            // 12 W game). Under a limiter it counts as a strike against the level instead; the level is booked as
+            // failed only when separate attempts at the same level strike again - that is the marginal edge that
+            // drops a frame every couple of seconds and would otherwise be re-probed forever, one dip per attempt.
+            bool strikeBooked = false;
+            if (recentDescent && longFrameEvent && !powerDeficit && AutoTDPCapped && AutoTDPSevereFrames == 0)
             {
-                // the level we just stepped down to cannot hold the target: it becomes the floor's lower neighbour
+                if (AutoTDPStrikeW == applied)
+                    AutoTDPStrikeCount++;
+                else
+                {
+                    AutoTDPStrikeW = applied;
+                    AutoTDPStrikeCount = 1;
+                }
+                strikeBooked = AutoTDPStrikeCount >= AUTOTDP_STRIKE_BOOK_COUNT;
+            }
+
+            if (recentDescent && (powerDeficit || strikeBooked))
+            {
+                // the level we just stepped down to cannot hold the target: it becomes the floor's lower neighbour.
+                // The booking is provisional until this deficit clears: if that takes far more power than the level
+                // we came from, the scene got heavier and the level was never the cause (see the deficit-cleared hook)
+                AutoTDPBookedPending = true;
+                AutoTDPBookedDownFromW = AutoTDPDownFromW;
+                AutoTDPBookedFloorPrev = AutoTDPFloorW;
+                AutoTDPBookedFailuresPrev = AutoTDPProbeFailures;
+                AutoTDPBookedBackoffPrev = AutoTDPProbeBackoffSec;
+
                 AutoTDPFloorW = applied + 1;
                 AutoTDPProbeFailures++;
                 AutoTDPProbeBackoffSec = Math.Min(AUTOTDP_PROBE_BACKOFF_MAX_SEC, AUTOTDP_PROBE_DWELL_SEC * Math.Pow(2, AutoTDPProbeFailures));
                 AutoTDPLastDownSec = 0;
+                AutoTDPStrikeW = AutoTDPStrikeCount = 0;
                 AutoTDP = Math.Max(AutoTDP, Math.Max(AutoTDPDownFromW, applied + 1));
                 AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
                 reason = "down-fail";
-                LogManager.LogInformation("AutoTDP: {0} W does not hold {1} FPS, floor {2} W, next probe after {3:F0} s", applied, target, AutoTDPFloorW, AutoTDPProbeBackoffSec);
+                LogManager.LogInformation("AutoTDP: {0} W does not hold {1} FPS ({2}), floor {3} W, next probe after {4:F0} s", applied, target, strikeBooked ? "repeated long frames" : "power deficit", AutoTDPFloorW, AutoTDPProbeBackoffSec);
             }
             else if (now >= AutoTDPUpSettleUntilSec)
             {
@@ -1442,7 +1478,7 @@ public static class PerformanceManager
             AutoTDPHeadroomSec += dt;
 
             if (AutoTDPLastDownSec > 0 && !recentDescent)
-                AutoTDPDescentSucceeded(applied);
+                AutoTDPDescentWindowPassed(applied);
 
             bool cautious = AutoTDPFloorW > 0 && applied - 1 < AutoTDPFloorW;
 
@@ -1454,6 +1490,11 @@ public static class PerformanceManager
             double settle = cautious ? AUTOTDP_PROBE_SETTLE_SEC : fast ? AUTOTDP_DOWN_SETTLE_FAST_SEC : AUTOTDP_DOWN_SETTLE_INRANGE_SEC;
             bool probePending = cautious && recentDescent;
             bool floorLocked = cautious && AutoTDPProbeFailures >= AUTOTDP_PROBE_MAX_FAILURES;
+
+            // a struck level is only attempted again after a full clean fail window at the level above, so the second
+            // strike is evidence about the level and not about the game's background hitch cadence
+            if (AutoTDPStrikeCount > 0 && applied - 1 <= AutoTDPStrikeW)
+                dwell = Math.Max(dwell, AUTOTDP_STRIKE_DWELL_SEC);
 
             // a locked floor gets one revalidation probe per session once the game has been quiet for a long time,
             // so a patch or a cooler device can still lower the learned limit; a failure locks it again for good
@@ -1469,6 +1510,7 @@ public static class PerformanceManager
             {
                 int step = surplus >= AUTOTDP_FASTER_DOWN_RATIO ? AUTOTDP_DOWN_STEP_FASTER_W : fast ? AUTOTDP_DOWN_STEP_FAST_W : 1;
                 AutoTDPDownFromW = applied;
+                AutoTDPDownToW = applied - step;
                 AutoTDPDownWasProbe = cautious;
                 AutoTDPLastDownSec = now;
                 AutoTDP = applied - step;
@@ -1485,7 +1527,7 @@ public static class PerformanceManager
             AutoTDPHoldSec += dt;
 
             if (AutoTDPLastDownSec > 0 && !recentDescent)
-                AutoTDPDescentSucceeded(applied);
+                AutoTDPDescentWindowPassed(applied);
 
             if (AutoTDPHoldSec >= AUTOTDP_HOLD_VALIDATE_SEC && !recentDescent)
             {
@@ -1496,14 +1538,45 @@ public static class PerformanceManager
             reason = "hold";
         }
 
-        // remember the level at which a deficit cleared, but only when we actually had to step up to clear it
-        // (a loading screen or menu hitch at the current level says nothing about the game's heavy scenes)
-        if (!deficit && AutoTDPInDeficit && AutoTDPDeficitWasPower && applied > AutoTDPDeficitStartApplied)
-            AutoTDPRangeMaxW = Math.Max(AutoTDPRangeMaxW, applied);
+        if (!deficit && AutoTDPInDeficit)
+        {
+            // remember the level at which a deficit cleared, but only when we actually had to step up to clear it
+            // (a loading screen or menu hitch at the current level says nothing about the game's heavy scenes)
+            if (AutoTDPDeficitWasPower && applied > AutoTDPDeficitStartApplied)
+                AutoTDPRangeMaxW = Math.Max(AutoTDPRangeMaxW, applied);
+
+            // a failure booked against a level is only valid if the level above it was enough again: a deficit that
+            // needed several watts more than we stepped down from was a heavier scene (menu to game, a cutscene, a
+            // new area), and must not raise the floor or spend a probe attempt
+            if (AutoTDPBookedPending)
+            {
+                if (applied >= AutoTDPBookedDownFromW + AUTOTDP_SCENE_CHANGE_W)
+                {
+                    LogManager.LogInformation("AutoTDP: deficit below {0} W cleared at {1} W - a scene change, floor back to {2} W", AutoTDPBookedDownFromW, applied, AutoTDPBookedFloorPrev);
+                    AutoTDPFloorW = AutoTDPBookedFloorPrev;
+                    AutoTDPProbeFailures = AutoTDPBookedFailuresPrev;
+                    AutoTDPProbeBackoffSec = AutoTDPBookedBackoffPrev;
+                }
+                AutoTDPBookedPending = false;
+            }
+        }
         AutoTDPInDeficit = deficit;
 
         AutoTDP = Math.Clamp(AutoTDP, TDPMin, Math.Max(TDPMin, AutoTDPMax));
         return reason;
+    }
+
+    /// <summary>
+    ///     The fail window after a down-step has passed without a booked failure. The step only counts as a success
+    ///     if we are still at (or below) the level it went to; a stutter that bought a watt inside the window leaves
+    ///     the step inconclusive - neither a failure nor a reset of the probe failure count.
+    /// </summary>
+    private static void AutoTDPDescentWindowPassed(double applied)
+    {
+        if (applied <= AutoTDPDownToW + 0.5)
+            AutoTDPDescentSucceeded(applied);
+        else
+            AutoTDPLastDownSec = 0;
     }
 
     private static void AutoTDPDescentSucceeded(double applied)
@@ -1511,6 +1584,10 @@ public static class PerformanceManager
         AutoTDPLastDownSec = 0;
         if (AutoTDPRangeMinW <= 0 || applied < AutoTDPRangeMinW)
             AutoTDPRangeMinW = applied;
+
+        // the level survived the fail window: any strikes against it (or a level above it) are void
+        if (AutoTDPStrikeCount > 0 && applied <= AutoTDPStrikeW)
+            AutoTDPStrikeW = AutoTDPStrikeCount = 0;
 
         if (AutoTDPDownWasProbe)
         {
@@ -1660,7 +1737,8 @@ public static class PerformanceManager
     /// <summary>
     ///     Updates the working baseline with a level that held. Min is the lowest level known to hold (the floor,
     ///     raised by failures, lowered by successful probes); Max follows the heaviest level that cleared a deficit
-    ///     this session, blended so a one-off spike fades.
+    ///     this session, blended so a one-off spike fades. While the range is open the baseline is the level that
+    ///     held; once it is complete the baseline is derived from the range (see <see cref="AUTOTDP_BASELINE_RANGE_BIAS"/>).
     /// </summary>
     private static void AutoTDPFoldIntoBaseline(double level, bool floorLocked)
     {
@@ -1675,7 +1753,15 @@ public static class PerformanceManager
         autoTDPBaseline.MaxWatts = autoTDPBaseline.Samples == 0
             ? sessionMax
             : Math.Max(level, autoTDPBaseline.MaxWatts + AUTOTDP_BASELINE_EWMA * (sessionMax - autoTDPBaseline.MaxWatts));
-        autoTDPBaseline.FloorLocked = floorLocked || autoTDPBaseline.FloorLocked && AutoTDPFloorW >= autoTDPBaseline.MinWatts;
+        // once established, the floor stays learned: a successful revalidation probe lowers MinWatts and the next
+        // session locks at the new value again - it never sends the game back to Learning
+        autoTDPBaseline.FloorLocked = floorLocked || autoTDPBaseline.FloorLocked;
+
+        // with the range complete the baseline is the middle of the range biased to the floor (min + a quarter of the
+        // span): the seed for later sessions and the value shown as "B" - low enough to be efficient from the first
+        // second, high enough that the usual scenes need no climb
+        if (autoTDPBaseline.FloorLocked && autoTDPBaseline.MaxWatts > autoTDPBaseline.MinWatts)
+            autoTDPBaseline.RecentWatts = Math.Round(autoTDPBaseline.MinWatts + AUTOTDP_BASELINE_RANGE_BIAS * (autoTDPBaseline.MaxWatts - autoTDPBaseline.MinWatts));
         autoTDPBaseline.Samples++;
         autoTDPBaseline.LastUpdatedUtc = DateTime.UtcNow;
         autoTDPBaseline.TemperatureAtConvergence = PlatformManager.LibreHardware?.GetCPUTemperature() ?? autoTDPBaseline.TemperatureAtConvergence;
@@ -1717,9 +1803,12 @@ public static class PerformanceManager
         AutoTDPHeadroomSec = AutoTDPDeficitSec = AutoTDPHoldSec = 0;
         AutoTDPUpSettleUntilSec = AutoTDPDownSettleUntilSec = AutoTDPLastStutterStepSec = 0;
         AutoTDPLastDownSec = 0;
-        AutoTDPDownFromW = 0;
+        AutoTDPDownFromW = AutoTDPDownToW = 0;
         AutoTDPDownWasProbe = false;
         AutoTDPInDeficit = AutoTDPInPowerDeficit = AutoTDPDeficitWasPower = false;
+        AutoTDPLongFrameActive = false;
+        AutoTDPStrikeW = AutoTDPStrikeCount = 0;
+        AutoTDPBookedPending = false;
         AutoTDPConvergeSec = 0;
         AutoTDPConvergedAtLevel = false;
         AutoTDPMaxLimitedSec = 0;
@@ -1760,9 +1849,20 @@ public static class PerformanceManager
     /// <summary>Key with the efficiency-rung segment blanked; identifies "this game, this target" across rungs.</summary>
     private static string AutoTDPKeyWithoutRung(string key)
     {
+        return AutoTDPKeyWithSegment(key, 3, "-");
+    }
+
+    /// <summary>Key with the fingerprint segment blanked; identifies "this game, preset, power line, rung, target" across power-profile edits.</summary>
+    private static string AutoTDPKeyWithoutFingerprint(string key)
+    {
+        return AutoTDPKeyWithSegment(key, 4, "-");
+    }
+
+    private static string AutoTDPKeyWithSegment(string key, int index, string value)
+    {
         string[] parts = key.Split('|');
-        if (parts.Length > 3)
-            parts[3] = "-";
+        if (parts.Length > index)
+            parts[index] = value;
         return string.Join("|", parts);
     }
 
@@ -1804,14 +1904,45 @@ public static class PerformanceManager
         if (profile is null)
             return;
 
+        bool migrated = false;
         lock (profile.SyncRoot)
         {
-            if (profile.AutoTDPBaselines.TryGetValue(key, out AutoTDPBaseline? stored) && stored is not null && stored.Samples > 0)
-                autoTDPBaseline = stored.Clone();
+            AutoTDPBaseline? exact = profile.AutoTDPBaselines.TryGetValue(key, out AutoTDPBaseline? stored) && stored is not null && stored.Samples > 0 ? stored : null;
+
+            // entries learned under an earlier edit of the power profile (different fingerprint) still hold the best
+            // knowledge about this game: an established floor beats a range that is still open, and any range beats
+            // starting from scratch. Such an entry moves to the current key instead of the game being learned again;
+            // its floor keeps its status and is revalidated by the usual quiet-time rule.
+            string identity = AutoTDPKeyWithoutFingerprint(key);
+            List<KeyValuePair<string, AutoTDPBaseline>> siblings = profile.AutoTDPBaselines
+                .Where(kv => kv.Key != key && kv.Value is not null && kv.Value.Samples > 0 && AutoTDPKeyWithoutFingerprint(kv.Key) == identity)
+                .OrderByDescending(kv => kv.Value.FloorLocked)
+                .ThenByDescending(kv => kv.Value.LastUpdatedUtc)
+                .ToList();
+
+            KeyValuePair<string, AutoTDPBaseline> sibling = siblings.FirstOrDefault();
+            if (exact is not null && (sibling.Value is null || exact.FloorLocked || !sibling.Value.FloorLocked))
+            {
+                autoTDPBaseline = exact.Clone();
+            }
+            else if (sibling.Value is not null)
+            {
+                autoTDPBaseline = sibling.Value.Clone();
+                profile.AutoTDPBaselines.Remove(sibling.Key);
+                profile.AutoTDPBaselines[key] = sibling.Value;
+                migrated = true;
+            }
         }
 
         if (autoTDPBaseline is null)
             return;
+
+        if (migrated)
+        {
+            LogManager.LogInformation("AutoTDP baseline migrated to {0} (power profile changed since it was learned)", key);
+            Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
+            AutoTDPRaiseBaselinesChanged(profile);
+        }
 
         // a stored baseline seeds and bounds the session; it only counts as "learned" (Tracking) once its floor was
         // established - otherwise the session continues in Learning until the floor probing completes
@@ -1867,7 +1998,20 @@ public static class PerformanceManager
         Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
         AutoTDPBaselineDirty = false;
         AutoTDPBaselineSavedSec = now;
-        AutoTDPBaselinesChanged?.Invoke(profile);
+        AutoTDPRaiseBaselinesChanged(profile);
+    }
+
+    /// <summary>UI listeners must never be able to fail the controller tick.</summary>
+    private static void AutoTDPRaiseBaselinesChanged(Profile profile)
+    {
+        try
+        {
+            AutoTDPBaselinesChanged?.Invoke(profile);
+        }
+        catch (Exception ex)
+        {
+            LogManager.LogWarning("AutoTDP baseline listener failed: {0}", ex.Message);
+        }
     }
 
     #endregion

@@ -3044,26 +3044,33 @@ namespace HandheldCompanion.ViewModels
 
         /// <summary>
         /// Rebuilds the learned AutoTDP baselines list from SelectedProfile.AutoTDPBaselines (newest first).
-        /// Called when the profile changes and whenever PerformanceManager writes baselines for it.
+        /// Called when the profile changes and whenever PerformanceManager writes baselines for it (controller
+        /// thread); the bound SettingsExpander items are UI-affine, so the rebuild is marshalled to the UI thread.
         /// </summary>
         private void RefreshAutoTDPBaselines()
         {
-            lock (_collectionLock8)
+            Profile? profile = SelectedProfile;
+            List<KeyValuePair<string, AutoTDPBaseline>> entries = new();
+            if (profile != null)
             {
-                AutoTDPBaselines.Clear();
-                Profile? profile = SelectedProfile;
-                if (profile != null)
-                {
-                    List<KeyValuePair<string, AutoTDPBaseline>> entries;
-                    lock (profile.SyncRoot)
-                        entries = profile.AutoTDPBaselines.OrderByDescending(kv => kv.Value.LastUpdatedUtc).ToList();
-
-                    foreach (KeyValuePair<string, AutoTDPBaseline> kv in entries)
-                        AutoTDPBaselines.Add(new AutoTDPBaselineViewModel(profile, kv.Key, kv.Value));
-                }
+                lock (profile.SyncRoot)
+                    entries = profile.AutoTDPBaselines.OrderByDescending(kv => kv.Value.LastUpdatedUtc).ToList();
             }
 
-            OnPropertyChanged(nameof(HasAutoTDPBaselines));
+            UIHelper.TryInvoke(() =>
+            {
+                lock (_collectionLock8)
+                {
+                    AutoTDPBaselines.Clear();
+                    if (profile != null)
+                    {
+                        foreach (KeyValuePair<string, AutoTDPBaseline> kv in entries)
+                            AutoTDPBaselines.Add(new AutoTDPBaselineViewModel(profile, kv.Key, kv.Value));
+                    }
+                }
+
+                OnPropertyChanged(nameof(HasAutoTDPBaselines));
+            });
         }
 
         private void PerformanceManager_AutoTDPBaselinesChanged(Profile profile)
