@@ -70,9 +70,9 @@ public enum AutoTDPState
 ///     Immutable snapshot of the AutoTDP controller published on every state or applied-wattage change.
 ///     Wattages are the integer values applied to the hardware; <see cref="Fps"/> is the 2 s window mean.
 /// </summary>
-public record AutoTDPStatus(AutoTDPState State, bool Capped, double TargetFps, double Fps, double SetpointW, double AppliedW, double? BaselineW, string EfficiencyRung, bool Optimizing)
+public record AutoTDPStatus(AutoTDPState State, bool Capped, double TargetFps, double Fps, double SetpointW, double AppliedW, double? BaselineW, double RangeMinW, double RangeMaxW, string EfficiencyRung, bool Optimizing)
 {
-    public static readonly AutoTDPStatus Idle = new(AutoTDPState.Disabled, false, 0, 0, 0, 0, null, string.Empty, false);
+    public static readonly AutoTDPStatus Idle = new(AutoTDPState.Disabled, false, 0, 0, 0, 0, null, 0, 0, string.Empty, false);
 }
 
 public static class PerformanceManager
@@ -108,6 +108,7 @@ public static class PerformanceManager
     private const double AUTOTDP_PROBE_FAIL_WINDOW_SEC = 10.0;     // a deficit within this window after a probe marks the probe as failed
     private const double AUTOTDP_PROBE_BACKOFF_MAX_SEC = 300.0;    // exponential back-off cap for repeated failed probes
     private const int AUTOTDP_PROBE_MAX_FAILURES = 3;              // consecutive failed probes after which the floor is locked for the session
+    private const double AUTOTDP_FLOOR_REVALIDATE_SEC = 300.0;     // quiet time before a learned (locked) floor is probed once more per session
     private const double AUTOTDP_FAST_DOWN_RATIO = 1.5;            // uncapped fps above target x this => 2 W down-steps, short dwell/settle
     private const double AUTOTDP_FASTER_DOWN_RATIO = 2.0;          // uncapped fps above target x this => 4 W down-steps
     private const int AUTOTDP_DOWN_STEP_FAST_W = 2;
@@ -188,6 +189,8 @@ public static class PerformanceManager
     private static double AutoTDPProbeBackoffSec;
     private static int AutoTDPProbeFailures;
     private static double AutoTDPConvergeSec, AutoTDPMaxLimitedSec;
+    private static bool AutoTDPFloorRevalidated;                  // the learned floor's one revalidation probe has been spent this session
+    private static double AutoTDPLastHoldValidW;                  // last level that held for AUTOTDP_HOLD_VALIDATE_SEC without deficit (folded into the baseline at session end)
     private static bool AutoTDPConvergedAtLevel;
     private static double AutoTDPPendingW;
 
@@ -774,7 +777,7 @@ public static class PerformanceManager
 
             Interlocked.Increment(ref autotdpGeneration);
             AutoTDPResetDwell();
-            AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = 0;
+            AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = AutoTDPLastHoldValidW = 0;
             AutoTDPProbeFailures = 0;
             AutoTDPProbeBackoffSec = 0;
             AutoTDP = AutoTDPMax;
@@ -922,6 +925,15 @@ public static class PerformanceManager
         if (string.IsNullOrEmpty(AutoTDPSessionId))
             return;
 
+        // end of a play session: fold what was learned (last validated level, floor, heavy level) into the
+        // baseline even if no 20 s convergence happened, so the next session starts from real observations
+        if (AutoTDPLastHoldValidW > 0 && AutoTDPApplied > 0)
+        {
+            bool established = AutoTDPFloorEstablished(AutoTDPLastHoldValidW);
+            if (autoTDPBaseline is null || autoTDPBaseline.RecentWatts != AutoTDPLastHoldValidW || autoTDPBaseline.FloorLocked != established || autoTDPBaseline.MaxWatts < AutoTDPRangeMaxW)
+                AutoTDPFoldIntoBaseline(AutoTDPLastHoldValidW, established);
+        }
+
         AutoTDPSaveBaseline(true);
         Interlocked.Increment(ref autotdpGeneration);
 
@@ -949,7 +961,7 @@ public static class PerformanceManager
 
         AutoTDPResetTelemetry();
         AutoTDPResetDwell();
-        AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = 0;
+        AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = AutoTDPLastHoldValidW = 0;
         AutoTDPProbeFailures = 0;
         AutoTDPProbeBackoffSec = 0;
 
@@ -1339,6 +1351,16 @@ public static class PerformanceManager
             bool probePending = cautious && recentDescent;
             bool floorLocked = cautious && AutoTDPProbeFailures >= AUTOTDP_PROBE_MAX_FAILURES;
 
+            // a locked floor gets one revalidation probe per session once the game has been quiet for a long time,
+            // so a patch or a cooler device can still lower the learned limit; a failure locks it again for good
+            if (floorLocked && !AutoTDPFloorRevalidated && AutoTDPHeadroomSec >= AUTOTDP_FLOOR_REVALIDATE_SEC)
+            {
+                AutoTDPFloorRevalidated = true;
+                AutoTDPProbeFailures = AUTOTDP_PROBE_MAX_FAILURES - 1;
+                floorLocked = false;
+                LogManager.LogInformation("AutoTDP: revalidating the learned floor of {0} W", AutoTDPFloorW);
+            }
+
             if (!probePending && !floorLocked && AutoTDPHeadroomSec >= dwell && now >= AutoTDPDownSettleUntilSec && now >= AutoTDPUpSettleUntilSec && AutoTDP > TDPMin + 0.5)
             {
                 int step = surplus >= AUTOTDP_FASTER_DOWN_RATIO ? AUTOTDP_DOWN_STEP_FASTER_W : fast ? AUTOTDP_DOWN_STEP_FAST_W : 1;
@@ -1365,6 +1387,7 @@ public static class PerformanceManager
             {
                 if (AutoTDPRangeMinW <= 0 || applied < AutoTDPRangeMinW)
                     AutoTDPRangeMinW = applied;
+                AutoTDPLastHoldValidW = applied;
             }
             reason = "hold";
         }
@@ -1496,14 +1519,49 @@ public static class PerformanceManager
         AutoTDPPublish(state, now, false);
     }
 
+    /// <summary>
+    ///     The floor is established when probing below it has failed enough times to lock it, or when the device
+    ///     minimum itself holds the target. Only then is the learned range complete.
+    /// </summary>
+    private static bool AutoTDPFloorEstablished(double level)
+    {
+        if (AutoTDPProbeFailures >= AUTOTDP_PROBE_MAX_FAILURES && AutoTDPFloorW > 0)
+            return true;
+
+        return level <= TDPMin + 0.5;
+    }
+
+    /// <summary>
+    ///     A level has held for <see cref="AUTOTDP_CONVERGE_SEC"/>. Folds it into the baseline; promotes Learning to
+    ///     Tracking only once the floor is established, so "learned" means the operating range is known.
+    /// </summary>
     private static void AutoTDPOnConverged()
     {
+        double level = AutoTDPApplied;
+        bool established = AutoTDPFloorEstablished(level);
+        if (established && AutoTDPFloorW <= 0)
+            AutoTDPFloorW = level;
+
         bool first = autoTDPBaseline is null;
+        AutoTDPFoldIntoBaseline(level, established);
+
+        bool promoted = !AutoTDPWarm && established;
+        if (promoted)
+            AutoTDPWarm = true;
+
+        LogManager.LogInformation("AutoTDP converged at {0} W for {1} FPS (range {2}-{3} W, floor {4}){5}", level, AutoTDPTargetFPS, autoTDPBaseline!.MinWatts, autoTDPBaseline.MaxWatts, established ? "locked" : "open", promoted ? ", tracking" : string.Empty);
+        AutoTDPSaveBaseline(first || promoted);
+    }
+
+    /// <summary>
+    ///     Updates the working baseline with a level that held. Min is the lowest level known to hold (the floor,
+    ///     raised by failures, lowered by successful probes); Max follows the heaviest level that cleared a deficit
+    ///     this session, blended so a one-off spike fades.
+    /// </summary>
+    private static void AutoTDPFoldIntoBaseline(double level, bool floorLocked)
+    {
         autoTDPBaseline ??= new AutoTDPBaseline();
 
-        // Min is the lowest level known to hold (the floor, raised by failures, lowered by successful probes);
-        // Max follows the heaviest level that cleared a deficit this session, blended so a one-off spike fades.
-        double level = AutoTDPApplied;
         double sessionMax = Math.Max(AutoTDPRangeMaxW, level);
         autoTDPBaseline.RecentWatts = level;
         autoTDPBaseline.TypicalWatts = autoTDPBaseline.Samples == 0
@@ -1513,16 +1571,11 @@ public static class PerformanceManager
         autoTDPBaseline.MaxWatts = autoTDPBaseline.Samples == 0
             ? sessionMax
             : Math.Max(level, autoTDPBaseline.MaxWatts + AUTOTDP_BASELINE_EWMA * (sessionMax - autoTDPBaseline.MaxWatts));
+        autoTDPBaseline.FloorLocked = floorLocked || autoTDPBaseline.FloorLocked && AutoTDPFloorW >= autoTDPBaseline.MinWatts;
         autoTDPBaseline.Samples++;
         autoTDPBaseline.LastUpdatedUtc = DateTime.UtcNow;
         autoTDPBaseline.TemperatureAtConvergence = PlatformManager.LibreHardware?.GetCPUTemperature() ?? autoTDPBaseline.TemperatureAtConvergence;
         AutoTDPBaselineDirty = true;
-
-        bool promoted = !AutoTDPWarm;
-        AutoTDPWarm = true;
-
-        LogManager.LogInformation("AutoTDP converged at {0} W for {1} FPS (range {2}-{3} W){4}", level, AutoTDPTargetFPS, autoTDPBaseline.MinWatts, autoTDPBaseline.MaxWatts, promoted ? ", tracking" : string.Empty);
-        AutoTDPSaveBaseline(first || promoted);
     }
 
     private static void AutoTDPPublish(AutoTDPState state, double now, bool force)
@@ -1531,7 +1584,7 @@ public static class PerformanceManager
         double applied = AutoTDPApplied;
         double? baseline = autoTDPBaseline is not null ? autoTDPBaseline.RecentWatts : null;
 
-        AutoTDPStatus status = new(state, AutoTDPCapped, AutoTDPTargetFPS, AutoTDPWinFps, AutoTDP, applied, baseline, AutoTDPEfficiencyTag(), effPhase != AutoTDPEfficiencyPhase.Idle);
+        AutoTDPStatus status = new(state, AutoTDPCapped, AutoTDPTargetFPS, AutoTDPWinFps, AutoTDP, applied, baseline, AutoTDPFloorW > 0 ? AutoTDPFloorW : AutoTDPRangeMinW, AutoTDPRangeMaxW, AutoTDPEfficiencyTag(), effPhase != AutoTDPEfficiencyPhase.Idle);
         autoTDPStatus = status;
 
         if (force || previous.State != state || previous.AppliedW != applied || previous.Capped != AutoTDPCapped || previous.EfficiencyRung != status.EfficiencyRung || previous.Optimizing != status.Optimizing)
@@ -1641,7 +1694,7 @@ public static class PerformanceManager
         autoTDPBaseline = null;
         AutoTDPBaselineDirty = false;
         AutoTDPWarm = false;
-        AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = 0;
+        AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = AutoTDPLastHoldValidW = 0;
         AutoTDPProbeFailures = 0;
         AutoTDPProbeBackoffSec = 0;
 
@@ -1658,10 +1711,18 @@ public static class PerformanceManager
         if (autoTDPBaseline is null)
             return;
 
-        AutoTDPWarm = true;
+        // a stored baseline seeds and bounds the session; it only counts as "learned" (Tracking) once its floor was
+        // established - otherwise the session continues in Learning until the floor probing completes
+        AutoTDPWarm = autoTDPBaseline.FloorLocked;
         AutoTDPRangeMinW = autoTDPBaseline.MinWatts;
         AutoTDPRangeMaxW = autoTDPBaseline.MaxWatts;
         AutoTDPFloorW = autoTDPBaseline.MinWatts;
+
+        // an established floor is a learned hard limit: the session does not probe below it again. One revalidation
+        // is allowed after the session has been quiet for a long time (game patches, cooler device), see AutoTDPStep.
+        if (autoTDPBaseline.FloorLocked && autoTDPBaseline.MinWatts > 0)
+            AutoTDPProbeFailures = AUTOTDP_PROBE_MAX_FAILURES;
+        AutoTDPFloorRevalidated = false;
     }
 
     /// <summary>

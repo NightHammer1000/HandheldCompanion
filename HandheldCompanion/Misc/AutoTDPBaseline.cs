@@ -23,6 +23,12 @@ namespace HandheldCompanion.Misc
         /// <summary>Highest applied level the game needed to clear a deficit.</summary>
         public double MaxWatts { get; set; }
 
+        /// <summary>
+        ///     <see cref="MinWatts"/> was established by failed probes below it (or by holding the device minimum):
+        ///     the range is complete and later sessions track instead of learn.
+        /// </summary>
+        public bool FloorLocked { get; set; }
+
         /// <summary>Number of convergences folded into <see cref="TypicalWatts"/>.</summary>
         public int Samples { get; set; }
 

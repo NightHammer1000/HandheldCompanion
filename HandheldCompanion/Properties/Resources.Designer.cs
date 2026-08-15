@@ -8985,7 +8985,7 @@ namespace HandheldCompanion.Properties {
         }
 
         /// <summary>
-        ///   Looks up a localized string similar to Learning · {0:0} W.
+        ///   Looks up a localized string similar to Learning · now {0:0} W · floor {1} · max {2}.
         /// </summary>
         public static string ProfilesPage_AutoTDPStatusLearning {
             get {
@@ -8994,7 +8994,7 @@ namespace HandheldCompanion.Properties {
         }
 
         /// <summary>
-        ///   Looks up a localized string similar to Tracking · baseline {0:0} W · now {1:0} W.
+        ///   Looks up a localized string similar to Tracking · baseline {0:0} W · floor {1:0} W · max {2:0} W · now {3:0} W.
         /// </summary>
         public static string ProfilesPage_AutoTDPStatusTracking {
             get {

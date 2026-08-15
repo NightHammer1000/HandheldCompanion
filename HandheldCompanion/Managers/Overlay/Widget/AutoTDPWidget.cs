@@ -36,8 +36,14 @@ public class AutoTDPWidget : IWidget
 
         if (_level == WidgetLevel.FULL)
         {
+            // learned range: floor (hard limit) and heavy level, then the baseline the session was seeded from
+            if (status.RangeMinW > 0 || status.RangeMaxW > 0)
+                entry.elements.Add(new OverlayEntryElement(
+                    (status.RangeMinW > 0 ? status.RangeMinW.ToString("0", CultureInfo.InvariantCulture) : "?") + "-" +
+                    (status.RangeMaxW > 0 ? status.RangeMaxW.ToString("0", CultureInfo.InvariantCulture) : "?"), "W", OverlayColors.DEFAULT_COLOR));
+
             if (status.BaselineW.HasValue)
-                entry.elements.Add(new OverlayEntryElement(status.BaselineW.Value.ToString("00", CultureInfo.InvariantCulture), "W", OverlayColors.DEFAULT_COLOR));
+                entry.elements.Add(new OverlayEntryElement("B" + status.BaselineW.Value.ToString("0", CultureInfo.InvariantCulture), "W", OverlayColors.DEFAULT_COLOR));
 
             entry.elements.Add(new OverlayEntryElement(StateWord(status), string.Empty, color));
 

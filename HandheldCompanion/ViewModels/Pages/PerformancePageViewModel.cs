@@ -408,10 +408,12 @@ namespace HandheldCompanion.ViewModels
                     case AutoTDPState.NoTelemetry:
                         return Resources.ProfilesPage_AutoTDPStatusNoTelemetry;
                     case AutoTDPState.Learning:
-                        text = string.Format(Resources.ProfilesPage_AutoTDPStatusLearning, status.AppliedW);
+                        text = string.Format(Resources.ProfilesPage_AutoTDPStatusLearning, status.AppliedW,
+                            status.RangeMinW > 0 ? $"{status.RangeMinW:0} W" : "?",
+                            status.RangeMaxW > 0 ? $"{status.RangeMaxW:0} W" : "?");
                         break;
                     case AutoTDPState.Tracking:
-                        text = string.Format(Resources.ProfilesPage_AutoTDPStatusTracking, status.BaselineW ?? status.AppliedW, status.AppliedW);
+                        text = string.Format(Resources.ProfilesPage_AutoTDPStatusTracking, status.BaselineW ?? status.AppliedW, status.RangeMinW, Math.Max(status.RangeMaxW, status.BaselineW ?? 0), status.AppliedW);
                         break;
                     case AutoTDPState.MaxLimited:
                         text = string.Format(Resources.ProfilesPage_AutoTDPStatusLimited, status.AppliedW);

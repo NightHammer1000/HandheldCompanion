@@ -1177,10 +1177,10 @@ Motion input toggle: press selected button(s) to switch motion state.</value>
     <value>Waiting for frame data</value>
   </data>
   <data name="ProfilesPage_AutoTDPStatusLearning" xml:space="preserve">
-    <value>Learning · {0:0} W</value>
+    <value>Learning · now {0:0} W · floor {1} · max {2}</value>
   </data>
   <data name="ProfilesPage_AutoTDPStatusTracking" xml:space="preserve">
-    <value>Tracking · baseline {0:0} W · now {1:0} W</value>
+    <value>Tracking · baseline {0:0} W · floor {1:0} W · max {2:0} W · now {3:0} W</value>
   </data>
   <data name="ProfilesPage_AutoTDPStatusLimited" xml:space="preserve">
     <value>Limited · {0:0} W (maximum reached)</value>
