@@ -102,6 +102,7 @@ public static class PerformanceManager
     private const int AUTOTDP_UP_STEP_W = 1;                       // up-step for a tail-only deficit or a stutter
     private const double AUTOTDP_UP_GAIN_REL = 0.05;               // +1 W per this fraction of the target the mean is short (60 fps: +1 W per 3 fps)
     private const int AUTOTDP_UP_STEP_MAX_W = 4;                   // cap on a single proportional up-step
+    private const double AUTOTDP_STUTTER_SPACING_SEC = 8.0;        // one stutter step per this many seconds (a hitch spans several ticks; loading screens stream)
     private const double AUTOTDP_DOWN_DWELL_INRANGE_SEC = 5.0;     // sustained headroom required before stepping down inside the known range
     private const double AUTOTDP_DOWN_SETTLE_INRANGE_SEC = 3.0;    // spacing between down-steps inside the known range
     private const double AUTOTDP_PROBE_DWELL_SEC = 15.0;           // sustained headroom required before probing below the known floor
@@ -191,6 +192,7 @@ public static class PerformanceManager
     private static int AutoTDPProbeFailures;
     private static double AutoTDPConvergeSec, AutoTDPMaxLimitedSec;
     private static bool AutoTDPFloorRevalidated;                  // the learned floor's one revalidation probe has been spent this session
+    private static double AutoTDPLastStutterStepSec;              // last time a stutter bought a watt
     private static double AutoTDPLastHoldValidW;                  // last level that held for AUTOTDP_HOLD_VALIDATE_SEC without deficit (folded into the baseline at session end)
     private static bool AutoTDPConvergedAtLevel;
     private static double AutoTDPPendingW;
@@ -1261,7 +1263,7 @@ public static class PerformanceManager
         //   target, and lone long frames at a mean far above the target are ignored entirely.
         bool meanShort = AutoTDPTrimFps < target - lowBand;
         bool tailDrift = AutoTDPCapped
-            ? AutoTDPP95Ratio > AUTOTDP_P95_RATIO
+            ? AutoTDPP95Ratio > AUTOTDP_P95_RATIO && AutoTDPSevereFrames == 0   // a window holding a storage hitch does not judge the tail (post-hitch catch-up frames pollute p95)
             : AutoTDPSlowFps < target * AUTOTDP_UNCAPPED_NEAR_RATIO && AutoTDPP95Ratio > AUTOTDP_UNCAPPED_P95_RATIO;
         bool powerDeficit = meanShort || tailDrift;
         bool stutter = AutoTDPCapped
@@ -1321,12 +1323,19 @@ public static class PerformanceManager
                     AutoTDP = applied + step;
                     reason = step > 1 ? "up+" + step : "up";
                 }
-                else
+                else if (now - AutoTDPLastStutterStepSec >= AUTOTDP_STUTTER_SPACING_SEC)
                 {
+                    // a long frame stays in the window for several ticks and loading screens produce them continuously:
+                    // one stutter buys one watt, once per spacing, never a climb
                     AutoTDP = applied + AUTOTDP_UP_STEP_W;
+                    AutoTDPLastStutterStepSec = now;
                     reason = "stutter";
                 }
-                AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
+                else
+                    reason = "stutter-hold";
+
+                if (reason != "stutter-hold")
+                    AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
             }
             else
                 reason = "up-settle";
@@ -1610,7 +1619,7 @@ public static class PerformanceManager
     private static void AutoTDPResetDwell()
     {
         AutoTDPHeadroomSec = AutoTDPDeficitSec = AutoTDPHoldSec = 0;
-        AutoTDPUpSettleUntilSec = AutoTDPDownSettleUntilSec = 0;
+        AutoTDPUpSettleUntilSec = AutoTDPDownSettleUntilSec = AutoTDPLastStutterStepSec = 0;
         AutoTDPLastDownSec = 0;
         AutoTDPDownFromW = 0;
         AutoTDPDownWasProbe = false;
