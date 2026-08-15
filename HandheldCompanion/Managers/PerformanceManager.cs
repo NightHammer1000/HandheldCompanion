@@ -337,6 +337,8 @@ public static class PerformanceManager
         SettingsManager_SettingValueChanged("PerformanceManagerEnabled", ManagerFactory.settingsManager.GetString("PerformanceManagerEnabled"), false, false);
         SettingsManager_SettingValueChanged("ConfigurableTDPOverrideDown", ManagerFactory.settingsManager.GetString("ConfigurableTDPOverrideDown"), false, false);
         SettingsManager_SettingValueChanged("ConfigurableTDPOverrideUp", ManagerFactory.settingsManager.GetString("ConfigurableTDPOverrideUp"), false, false);
+        // DEBUG BUILD: force the AutoTDP trace on regardless of a value pinned in user.config (revert before merge)
+        ManagerFactory.settingsManager.SetProperty(Settings.AutoTDPTraceEnabled, true, true);
         SettingsManager_SettingValueChanged(Settings.AutoTDPTraceEnabled, ManagerFactory.settingsManager.GetString(Settings.AutoTDPTraceEnabled), false, false);
         // AMD
         SettingsManager_SettingValueChanged("RyzenAdjCoAll", ManagerFactory.settingsManager.GetString("RyzenAdjCoAll"), false, false);
