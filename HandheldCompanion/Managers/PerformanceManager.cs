@@ -108,7 +108,13 @@ public static class PerformanceManager
     private const double AUTOTDP_PROBE_FAIL_WINDOW_SEC = 10.0;     // a deficit within this window after a probe marks the probe as failed
     private const double AUTOTDP_PROBE_BACKOFF_MAX_SEC = 300.0;    // exponential back-off cap for repeated failed probes
     private const int AUTOTDP_PROBE_MAX_FAILURES = 3;              // consecutive failed probes after which the floor is locked for the session
-    private const double AUTOTDP_FAST_DOWN_RATIO = 1.5;            // uncapped fps above target x this => 2 W down-steps
+    private const double AUTOTDP_FAST_DOWN_RATIO = 1.5;            // uncapped fps above target x this => 2 W down-steps, short dwell/settle
+    private const double AUTOTDP_FASTER_DOWN_RATIO = 2.0;          // uncapped fps above target x this => 4 W down-steps
+    private const int AUTOTDP_DOWN_STEP_FAST_W = 2;
+    private const int AUTOTDP_DOWN_STEP_FASTER_W = 4;
+    private const double AUTOTDP_DOWN_DWELL_FAST_SEC = 2.0;        // headroom dwell before the first fast down-step
+    private const double AUTOTDP_DOWN_SETTLE_FAST_SEC = 2.0;       // spacing between fast down-steps
+    private const int AUTOTDP_MAX_STEP_DOWN_W = 4;                 // maximum downward change per write
     private const float AUTOTDP_GPU_GATE_PCT = 85.0f;              // do not step down while GPU load is at or above this
     private const double AUTOTDP_CAP_DETECT_SEC = 10.0;            // fps never above target while tail clean for this long => behaviourally capped
     private const double AUTOTDP_CAP_STICKY_SEC = 30.0;            // behavioural cap detection stays latched for this long
@@ -1309,14 +1315,19 @@ public static class PerformanceManager
                 AutoTDPDescentSucceeded(applied);
 
             bool cautious = AutoTDPFloorW > 0 && applied - 1 < AutoTDPFloorW;
-            double dwell = cautious ? Math.Max(AUTOTDP_PROBE_DWELL_SEC, AutoTDPProbeBackoffSec) : AUTOTDP_DOWN_DWELL_INRANGE_SEC;
-            double settle = cautious ? AUTOTDP_PROBE_SETTLE_SEC : AUTOTDP_DOWN_SETTLE_INRANGE_SEC;
+
+            // the further above the target an uncapped game runs, the bigger and quicker the steps: the first watts
+            // are obviously surplus, only the last few need care
+            double surplus = AutoTDPCapped || cautious ? 1.0 : AutoTDPSlowFps / Math.Max(1.0, target);
+            bool fast = surplus >= AUTOTDP_FAST_DOWN_RATIO;
+            double dwell = cautious ? Math.Max(AUTOTDP_PROBE_DWELL_SEC, AutoTDPProbeBackoffSec) : fast ? AUTOTDP_DOWN_DWELL_FAST_SEC : AUTOTDP_DOWN_DWELL_INRANGE_SEC;
+            double settle = cautious ? AUTOTDP_PROBE_SETTLE_SEC : fast ? AUTOTDP_DOWN_SETTLE_FAST_SEC : AUTOTDP_DOWN_SETTLE_INRANGE_SEC;
             bool probePending = cautious && recentDescent;
             bool floorLocked = cautious && AutoTDPProbeFailures >= AUTOTDP_PROBE_MAX_FAILURES;
 
             if (!probePending && !floorLocked && AutoTDPHeadroomSec >= dwell && now >= AutoTDPDownSettleUntilSec && now >= AutoTDPUpSettleUntilSec && AutoTDP > TDPMin + 0.5)
             {
-                int step = !cautious && !AutoTDPCapped && AutoTDPSlowFps > AUTOTDP_FAST_DOWN_RATIO * target ? 2 : 1;
+                int step = surplus >= AUTOTDP_FASTER_DOWN_RATIO ? AUTOTDP_DOWN_STEP_FASTER_W : fast ? AUTOTDP_DOWN_STEP_FAST_W : 1;
                 AutoTDPDownFromW = applied;
                 AutoTDPDownWasProbe = cautious;
                 AutoTDPLastDownSec = now;
@@ -1383,7 +1394,7 @@ public static class PerformanceManager
         {
             double delta = candidate - AutoTDPApplied;
             double maxUp = reason == "jump" || reason == "down-fail" ? AUTOTDP_MAX_JUMP_W : AUTOTDP_MAX_STEP_W;
-            delta = Math.Clamp(delta, -AUTOTDP_MAX_STEP_W, maxUp);
+            delta = Math.Clamp(delta, -AUTOTDP_MAX_STEP_DOWN_W, maxUp);
             candidate = AutoTDPApplied + delta;
         }
 
