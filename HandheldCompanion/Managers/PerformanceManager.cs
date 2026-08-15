@@ -185,6 +185,12 @@ public static class PerformanceManager
     private static string AutoTDPSessionId = string.Empty;
     private static string AutoTDPSessionExecutable = string.Empty;
     private static Profile? AutoTDPSessionProfile;
+    private static string AutoTDPResumeKey = string.Empty;        // short-gap resume (alt-tab): last key (rung-agnostic), level, memory and efficiency state
+    private static double AutoTDPResumeApplied, AutoTDPResumeRangeMin, AutoTDPResumeRangeMax, AutoTDPResumeFloor, AutoTDPResumeSec;
+    private static uint? AutoTDPResumeEpp;
+    private static CoreParkingMode? AutoTDPResumeCore;
+    private static bool[]? AutoTDPResumeTried;
+    private const double AUTOTDP_RESUME_WINDOW_SEC = 300.0;
     private static string AutoTDPBaselineKey = string.Empty;
     private static AutoTDPBaseline? autoTDPBaseline;
     private static bool AutoTDPWarm;                              // a baseline was loaded or learned this session (Tracking)
@@ -721,16 +727,35 @@ public static class PerformanceManager
         autotdpLock.Enter();
         try
         {
+            // drop this game/target's baselines for every efficiency rung, then start over at the configured rung
             Profile? profile = AutoTDPSessionProfile;
             if (profile is not null && !string.IsNullOrEmpty(AutoTDPBaselineKey))
             {
-                bool removed;
+                string identity = AutoTDPKeyWithoutRung(AutoTDPBaselineKey);
+                int removed;
                 lock (profile.SyncRoot)
-                    removed = profile.AutoTDPBaselines.Remove(AutoTDPBaselineKey);
+                {
+                    List<string> keys = profile.AutoTDPBaselines.Keys.Where(k => AutoTDPKeyWithoutRung(k) == identity).ToList();
+                    removed = keys.Count;
+                    foreach (string k in keys)
+                        profile.AutoTDPBaselines.Remove(k);
+                }
 
-                if (removed)
+                if (removed > 0)
                     ManagerFactory.profileManager.SerializeProfile(profile);
             }
+
+            AutoTDPResumeKey = string.Empty;
+
+            if (AutoTDPEfficiencyActive || effPhase != AutoTDPEfficiencyPhase.Idle)
+            {
+                AutoTDPEfficiencyClearOverrides();
+                if (currentProfile is not null)
+                    RequestCoreParkingMode(EffectiveCoreMode(currentProfile));
+                AutoTDPRekeyForEfficiency();
+            }
+            else
+                AutoTDPEfficiencyClearOverrides();
 
             autoTDPBaseline = null;
             AutoTDPBaselineDirty = false;
@@ -811,11 +836,32 @@ public static class PerformanceManager
         AutoTDPLoadBaseline(key);
         AutoTDPSeedFromBaseline();
 
+        // the same game coming straight back (alt-tab, overlay) continues where it left off instead of re-seeding,
+        // including any efficiency step it had already committed
+        bool resumed = string.Equals(AutoTDPKeyWithoutRung(key), AutoTDPResumeKey, StringComparison.Ordinal) && AutoTDPResumeApplied > 0 && AutoTDPNowSec - AutoTDPResumeSec < AUTOTDP_RESUME_WINDOW_SEC;
+        if (resumed)
+        {
+            if (AutoTDPResumeEpp.HasValue || AutoTDPResumeCore.HasValue)
+            {
+                effAcceptedEpp = AutoTDPResumeEpp;
+                effAcceptedCore = AutoTDPResumeCore;
+                if (AutoTDPResumeTried is not null)
+                    Array.Copy(AutoTDPResumeTried, effTried, Math.Min(effTried.Length, AutoTDPResumeTried.Length));
+                AutoTDPEfficiencySetState(effAcceptedEpp, effAcceptedCore);
+                AutoTDPRekeyForEfficiency();
+            }
+
+            AutoTDP = Math.Clamp(AutoTDPResumeApplied, TDPMin, Math.Max(TDPMin, AutoTDPMax));
+            AutoTDPRangeMinW = AutoTDPResumeRangeMin;
+            AutoTDPRangeMaxW = AutoTDPResumeRangeMax;
+            AutoTDPFloorW = AutoTDPResumeFloor;
+        }
+
         bool hooked = PlatformManager.RTSS?.HasHook() ?? false;
         if (!hooked)
             RestoreTDP(true);
 
-        LogManager.LogInformation("AutoTDP session started: key={0}, seed={1} W, max={2} W, warm={3}", key, AutoTDP, AutoTDPMax, AutoTDPWarm);
+        LogManager.LogInformation("AutoTDP session started: key={0}, seed={1} W, max={2} W, warm={3}, resumed={4}", key, AutoTDP, AutoTDPMax, AutoTDPWarm, resumed);
         AutoTDPPublish(hooked ? (AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning) : AutoTDPState.NoTelemetry, AutoTDPNowSec, true);
     }
 
@@ -866,6 +912,18 @@ public static class PerformanceManager
 
         AutoTDPSaveBaseline(true);
         Interlocked.Increment(ref autotdpGeneration);
+
+        // remember where this key was, so a short interruption resumes rather than re-seeds
+        AutoTDPResumeKey = AutoTDPKeyWithoutRung(AutoTDPBaselineKey);
+        AutoTDPResumeApplied = AutoTDPApplied;
+        AutoTDPResumeRangeMin = AutoTDPRangeMinW;
+        AutoTDPResumeRangeMax = AutoTDPRangeMaxW;
+        AutoTDPResumeFloor = AutoTDPFloorW;
+        AutoTDPResumeEpp = effAcceptedEpp;
+        AutoTDPResumeCore = effAcceptedCore;
+        AutoTDPResumeTried = (bool[])effTried.Clone();
+        AutoTDPResumeSec = AutoTDPNowSec;
+
         AutoTDPEfficiencyClearOverrides();
 
         AutoTDPSessionId = string.Empty;
@@ -1439,6 +1497,15 @@ public static class PerformanceManager
     private static string AutoTDPBuildKey(string sessionId, float targetFps)
     {
         return string.Concat(sessionId, "|", Math.Round(targetFps).ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>Key with the efficiency-rung segment blanked; identifies "this game, this target" across rungs.</summary>
+    private static string AutoTDPKeyWithoutRung(string key)
+    {
+        string[] parts = key.Split('|');
+        if (parts.Length > 3)
+            parts[3] = "-";
+        return string.Join("|", parts);
     }
 
     /// <summary>Stable 32-bit FNV-1a over the power-profile fields that change the fps/W relationship.</summary>
