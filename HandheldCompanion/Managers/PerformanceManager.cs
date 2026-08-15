@@ -92,8 +92,10 @@ public static class PerformanceManager
     private const double AUTOTDP_LOW_BAND_FPS = 0.5;               // below target by more than max(this, 1 %) => short of target
     private const double AUTOTDP_HIGH_BAND_FPS = 2.0;              // above target by more than max(this, 3 %) => uncapped surplus
     private const double AUTOTDP_LONGFRAME_RATIO = 1.15;           // a frame longer than target frametime x this counts as a long frame
-    private const int AUTOTDP_LONGFRAME_COUNT = 1;                 // long frames in the window that constitute a deficit
-    private const double AUTOTDP_P95_RATIO = 1.05;                 // p95 frametime above target x this => deficit
+    private const int AUTOTDP_LONGFRAME_COUNT = 1;                 // long frames in the window that constitute a deficit (capped)
+    private const double AUTOTDP_P95_RATIO = 1.05;                 // p95 frametime above target x this => deficit (capped)
+    private const double AUTOTDP_UNCAPPED_SEVERE_RATIO = 2.0;      // uncapped: only a frame longer than target x this counts as a stutter
+    private const double AUTOTDP_UNCAPPED_P95_RATIO = 1.35;        // uncapped: p95 above target x this => deficit (uncapped frametimes jitter by design)
     private const double AUTOTDP_TAIL_CLEAN_RATIO = 1.02;          // p95 frametime at or below target x this => tail is immaculate
     private const double AUTOTDP_UP_SETTLE_SEC = 1.0;              // minimum spacing between consecutive up-steps
     private const int AUTOTDP_UP_STEP_W = 1;                       // up-step on a tail-only deficit
@@ -165,7 +167,8 @@ public static class PerformanceManager
     private static uint AutoTDPLastStatCount;
     private static double AutoTDPStaleSec;
     private static double AutoTDPWinFps, AutoTDPSlowFps, AutoTDPP95Ratio;
-    private static int AutoTDPLongFrames;
+    private static int AutoTDPLongFrames, AutoTDPSevereFrames;
+    private static double AutoTDPDeficitStartApplied;             // level when the current deficit began (rangeMax only grows if we had to step up)
     private static float? AutoTDPGpuLoad;
 
     // AutoTDP - dwell / descent memory for the current session
@@ -786,7 +789,7 @@ public static class PerformanceManager
     /// </summary>
     private static void AutoTDPApplyProfile(PowerProfile profile, double autoMax)
     {
-        string executable = ProcessManager.GetCurrent()?.Executable ?? string.Empty;
+        string executable = AutoTDPCurrentExecutable();
         string sessionId = AutoTDPBuildSessionId(profile, executable);
         string key = AutoTDPBuildKey(sessionId, profile.AutoTDPRequestedFPS);
 
@@ -947,6 +950,19 @@ public static class PerformanceManager
         AutoTDPStatusChanged?.Invoke(autoTDPStatus);
     }
 
+    /// <summary>Executable that identifies the game for baseline purposes: the foreground process, else whatever RTSS has hooked.</summary>
+    private static string AutoTDPCurrentExecutable()
+    {
+        string executable = ProcessManager.GetCurrent()?.Executable ?? string.Empty;
+        if (string.IsNullOrEmpty(executable))
+        {
+            string? hooked = PlatformManager.RTSS?.GetAppEntry()?.Name;
+            if (!string.IsNullOrEmpty(hooked))
+                executable = Path.GetFileName(hooked);
+        }
+        return executable;
+    }
+
     private static void RTSS_Hooked(AppEntry appEntry)
     {
         if (string.IsNullOrEmpty(AutoTDPSessionId))
@@ -960,6 +976,24 @@ public static class PerformanceManager
             AutoTDPResetDwell();
             AutoTDPApplied = 0;
             AutoTDPLastWriteSec = 0;
+
+            // a session that started before the game was known adopts the hooked executable in place, keeping what it learned
+            if (string.IsNullOrEmpty(AutoTDPSessionExecutable) && currentProfile is not null && !string.IsNullOrEmpty(appEntry?.Name))
+            {
+                AutoTDPSessionExecutable = Path.GetFileName(appEntry.Name);
+                string sessionId = AutoTDPBuildSessionId(currentProfile, AutoTDPSessionExecutable);
+                string key = AutoTDPBuildKey(sessionId, (float)AutoTDPTargetFPS);
+
+                double rangeMin = AutoTDPRangeMinW, rangeMax = AutoTDPRangeMaxW, floor = AutoTDPFloorW;
+                AutoTDPSessionId = sessionId;
+                AutoTDPRetarget(key, (float)AutoTDPTargetFPS);
+                if (autoTDPBaseline is null)
+                {
+                    AutoTDPRangeMinW = rangeMin;
+                    AutoTDPRangeMaxW = rangeMax;
+                    AutoTDPFloorW = floor;
+                }
+            }
         }
         finally
         {
@@ -1117,7 +1151,7 @@ public static class PerformanceManager
 
         int n = 0;
         double sum = 0;
-        int longFrames = 0;
+        int longFrames = 0, severeFrames = 0;
         for (int i = 0; i < AutoTDPFrameCount && n < AUTOTDP_FRAME_RING; i++)
         {
             int idx = (AutoTDPFrameHead - 1 - i) & (AUTOTDP_FRAME_RING - 1);
@@ -1126,6 +1160,8 @@ public static class PerformanceManager
             sum += ft;
             if (ft > ftTarget * AUTOTDP_LONGFRAME_RATIO)
                 longFrames++;
+            if (ft > ftTarget * AUTOTDP_UNCAPPED_SEVERE_RATIO)
+                severeFrames++;
             if (sum >= windowMs && n >= 8)
                 break;
         }
@@ -1135,6 +1171,7 @@ public static class PerformanceManager
 
         AutoTDPWinFps = n / (sum / 1000.0);
         AutoTDPLongFrames = longFrames;
+        AutoTDPSevereFrames = severeFrames;
 
         Array.Sort(AutoTDPWindowScratch, 0, n);
         int p95Index = Math.Clamp((int)Math.Ceiling(0.95 * n) - 1, 0, n - 1);
@@ -1180,7 +1217,12 @@ public static class PerformanceManager
         double lowBand = Math.Max(AUTOTDP_LOW_BAND_FPS, 0.01 * target);
         double highBand = Math.Max(AUTOTDP_HIGH_BAND_FPS, 0.03 * target);
 
-        bool deficit = AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT || AutoTDPP95Ratio > AUTOTDP_P95_RATIO || AutoTDPWinFps < target - lowBand;
+        // Capped (limiter/VSync at the target): frametimes are flat, so any long frame or p95 drift is a real deficit.
+        // Uncapped: frametimes jitter by design; only the window mean and gross stutter count, otherwise the tail rule
+        // would force the mean far above the target.
+        bool deficit = AutoTDPCapped
+            ? AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT || AutoTDPP95Ratio > AUTOTDP_P95_RATIO || AutoTDPWinFps < target - lowBand
+            : AutoTDPWinFps < target - lowBand || AutoTDPSevereFrames >= 1 || AutoTDPP95Ratio > AUTOTDP_UNCAPPED_P95_RATIO;
         bool shortfall = AutoTDPWinFps < target - 2 * lowBand;
         bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
         bool gpuOk = AutoTDPGpuLoad is null || AutoTDPGpuLoad < AUTOTDP_GPU_GATE_PCT;
@@ -1193,6 +1235,9 @@ public static class PerformanceManager
 
         if (deficit)
         {
+            if (!AutoTDPInDeficit)
+                AutoTDPDeficitStartApplied = applied;
+
             AutoTDPHeadroomSec = 0;
             AutoTDPHoldSec = 0;
             AutoTDPDeficitSec += dt;
@@ -1271,8 +1316,9 @@ public static class PerformanceManager
             reason = "hold";
         }
 
-        // remember the level at which a deficit cleared: that is the heaviest known-good level for this session
-        if (!deficit && AutoTDPInDeficit)
+        // remember the level at which a deficit cleared, but only when we actually had to step up to clear it
+        // (a loading screen or menu hitch at the current level says nothing about the game's heavy scenes)
+        if (!deficit && AutoTDPInDeficit && applied > AutoTDPDeficitStartApplied)
             AutoTDPRangeMaxW = Math.Max(AutoTDPRangeMaxW, applied);
         AutoTDPInDeficit = deficit;
 
@@ -1452,7 +1498,7 @@ public static class PerformanceManager
         AutoTDPStaleSec = 0;
         AutoTDPWinFps = AutoTDPSlowFps = 0;
         AutoTDPP95Ratio = 0;
-        AutoTDPLongFrames = 0;
+        AutoTDPLongFrames = AutoTDPSevereFrames = 0;
         AutoTDPGpuLoad = null;
     }
 
@@ -1625,7 +1671,7 @@ public static class PerformanceManager
                     Directory.CreateDirectory(App.LogsPath);
                     string path = Path.Combine(App.LogsPath, $"autotdp-{DateTime.Now:yyyyMMdd-HHmmss}.csv");
                     autoTDPTrace = new StreamWriter(path, false) { AutoFlush = true };
-                    autoTDPTrace.WriteLine("t,fps,slowFps,p95Ratio,longFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key");
+                    autoTDPTrace.WriteLine("t,fps,slowFps,p95Ratio,longFrames,severeFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key");
                 }
 
                 autoTDPTrace.WriteLine(string.Join(",",
@@ -1634,6 +1680,7 @@ public static class PerformanceManager
                     AutoTDPSlowFps.ToString("F2", CultureInfo.InvariantCulture),
                     AutoTDPP95Ratio.ToString("F3", CultureInfo.InvariantCulture),
                     AutoTDPLongFrames,
+                    AutoTDPSevereFrames,
                     AutoTDPGpuLoad?.ToString("F0", CultureInfo.InvariantCulture) ?? string.Empty,
                     AutoTDPCapped ? 1 : 0,
                     AutoTDP.ToString("F2", CultureInfo.InvariantCulture),
