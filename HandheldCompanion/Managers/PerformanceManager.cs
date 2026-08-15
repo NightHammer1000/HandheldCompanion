@@ -115,7 +115,6 @@ public static class PerformanceManager
     private const double AUTOTDP_DOWN_DWELL_FAST_SEC = 2.0;        // headroom dwell before the first fast down-step
     private const double AUTOTDP_DOWN_SETTLE_FAST_SEC = 2.0;       // spacing between fast down-steps
     private const int AUTOTDP_MAX_STEP_DOWN_W = 4;                 // maximum downward change per write
-    private const float AUTOTDP_GPU_GATE_PCT = 85.0f;              // do not step down while GPU load is at or above this
     private const double AUTOTDP_CAP_DETECT_SEC = 10.0;            // fps never above target while tail clean for this long => behaviourally capped
     private const double AUTOTDP_CAP_STICKY_SEC = 30.0;            // behavioural cap detection stays latched for this long
     private const double AUTOTDP_WRITE_SPACING_SEC = 1.0;          // minimum spacing between hardware writes
@@ -874,6 +873,7 @@ public static class PerformanceManager
             RestoreTDP(true);
 
         LogManager.LogInformation("AutoTDP session started: key={0}, seed={1} W, max={2} W, warm={3}, resumed={4}", key, AutoTDP, AutoTDPMax, AutoTDPWarm, resumed);
+        AutoTDPTrace(AutoTDPNowSec, resumed ? "session-resume" : "session-start");
         AutoTDPPublish(hooked ? (AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning) : AutoTDPState.NoTelemetry, AutoTDPNowSec, true);
     }
 
@@ -1079,7 +1079,8 @@ public static class PerformanceManager
         }
         catch (Exception ex)
         {
-            LogManager.LogWarning("AutoTDP tick failed: {0}", ex.Message);
+            LogManager.LogWarning("AutoTDP tick failed: {0}", ex);
+            AutoTDPTrace(AutoTDPNowSec, "error:" + ex.GetType().Name + ":" + ex.Message.Replace(',', ';').Replace('\n', ' ').Replace('\r', ' '));
         }
         finally
         {
@@ -1248,8 +1249,8 @@ public static class PerformanceManager
         bool deficit = powerDeficit || stutter;
         bool shortfall = AutoTDPWinFps < target - 2 * lowBand;
         bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
-        bool gpuOk = AutoTDPGpuLoad is null || AutoTDPGpuLoad < AUTOTDP_GPU_GATE_PCT;
-        bool headroom = AutoTDPSlowFps > target + highBand || (AutoTDPCapped && tailClean && gpuOk);
+        // Intel GPU "load" reads ~100 % whenever the GPU is busy regardless of power (verified on device); it is not a headroom signal
+        bool headroom = AutoTDPSlowFps > target + highBand || (AutoTDPCapped && tailClean);
 
         // before the first successful write the setpoint itself is the best estimate of the applied level
         double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
@@ -1696,9 +1697,11 @@ public static class PerformanceManager
 
     #region AutoTDP trace
 
+    private static double autoTDPTraceRetrySec;
+
     private static void AutoTDPTrace(double now, string reason)
     {
-        if (!autoTDPTraceEnabled)
+        if (!autoTDPTraceEnabled || now < autoTDPTraceRetrySec)
             return;
 
         lock (autoTDPTraceLock)
@@ -1708,9 +1711,10 @@ public static class PerformanceManager
                 if (autoTDPTrace is null)
                 {
                     Directory.CreateDirectory(App.LogsPath);
-                    string path = Path.Combine(App.LogsPath, $"autotdp-{DateTime.Now:yyyyMMdd-HHmmss}.csv");
+                    string path = Path.Combine(App.LogsPath, $"autotdp-{DateTime.Now:yyyyMMdd-HHmmss-fff}.csv");
                     autoTDPTrace = new StreamWriter(path, false) { AutoFlush = true };
                     autoTDPTrace.WriteLine("t,fps,slowFps,p95Ratio,longFrames,severeFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key");
+                    LogManager.LogInformation("AutoTDP trace: {0}", path);
                 }
 
                 autoTDPTrace.WriteLine(string.Join(",",
@@ -1733,8 +1737,11 @@ public static class PerformanceManager
             }
             catch (Exception ex)
             {
+                // do not give up on tracing for the whole run; retry after a pause
                 LogManager.LogWarning("AutoTDP trace failed: {0}", ex.Message);
-                autoTDPTraceEnabled = false;
+                autoTDPTrace?.Dispose();
+                autoTDPTrace = null;
+                autoTDPTraceRetrySec = now + 30.0;
             }
         }
     }
