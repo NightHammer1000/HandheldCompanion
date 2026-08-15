@@ -172,7 +172,7 @@ public static class PerformanceManager
     private static int AutoTDPFrameHead, AutoTDPFrameCount;
     private static uint AutoTDPLastStatCount;
     private static double AutoTDPStaleSec;
-    private static double AutoTDPWinFps, AutoTDPSlowFps, AutoTDPP95Ratio;
+    private static double AutoTDPWinFps, AutoTDPTrimFps, AutoTDPSlowFps, AutoTDPP95Ratio;   // TrimFps excludes frames > 2x target (storage hitches) from the mean
     private static int AutoTDPLongFrames, AutoTDPSevereFrames;
     private static double AutoTDPDeficitStartApplied;             // level when the current deficit began (rangeMax only grows if we had to step up)
     private static bool AutoTDPDeficitWasPower, AutoTDPInPowerDeficit;   // power deficit (mean short / tail drift) vs a lone stutter
@@ -1164,7 +1164,7 @@ public static class PerformanceManager
         double windowMs = AUTOTDP_WINDOW_SEC * 1000.0;
 
         int n = 0;
-        double sum = 0;
+        double sum = 0, severeSum = 0;
         int longFrames = 0, severeFrames = 0;
         for (int i = 0; i < AutoTDPFrameCount && n < AUTOTDP_FRAME_RING; i++)
         {
@@ -1175,7 +1175,10 @@ public static class PerformanceManager
             if (ft > ftTarget * AUTOTDP_LONGFRAME_RATIO)
                 longFrames++;
             if (ft > ftTarget * AUTOTDP_UNCAPPED_SEVERE_RATIO)
+            {
                 severeFrames++;
+                severeSum += ft;
+            }
             if (sum >= windowMs && n >= 8)
                 break;
         }
@@ -1186,6 +1189,11 @@ public static class PerformanceManager
         AutoTDPWinFps = n / (sum / 1000.0);
         AutoTDPLongFrames = longFrames;
         AutoTDPSevereFrames = severeFrames;
+
+        // a single storage hitch (hundreds of ms) can halve the window mean while every other frame is on time;
+        // the power-deficit test uses the mean without those frames so a hitch never reads as "cannot hold"
+        int trimmed = n - severeFrames;
+        AutoTDPTrimFps = trimmed > 0 && sum - severeSum > 0 ? trimmed / ((sum - severeSum) / 1000.0) : AutoTDPWinFps;
 
         Array.Sort(AutoTDPWindowScratch, 0, n);
         int p95Index = Math.Clamp((int)Math.Ceiling(0.95 * n) - 1, 0, n - 1);
@@ -1238,7 +1246,7 @@ public static class PerformanceManager
         //   Capped (limiter/VSync at the target): frametimes are flat, so any long frame is a stutter and p95 drift is
         //   a power deficit. Uncapped: frametimes jitter by design; the tail only counts while the mean sits near the
         //   target, and lone long frames at a mean far above the target are ignored entirely.
-        bool meanShort = AutoTDPWinFps < target - lowBand;
+        bool meanShort = AutoTDPTrimFps < target - lowBand;
         bool tailDrift = AutoTDPCapped
             ? AutoTDPP95Ratio > AUTOTDP_P95_RATIO
             : AutoTDPSlowFps < target * AUTOTDP_UNCAPPED_NEAR_RATIO && AutoTDPP95Ratio > AUTOTDP_UNCAPPED_P95_RATIO;
@@ -1247,7 +1255,7 @@ public static class PerformanceManager
             ? AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT
             : AutoTDPSlowFps < target * AUTOTDP_UNCAPPED_NEAR_RATIO && AutoTDPSevereFrames >= 1;
         bool deficit = powerDeficit || stutter;
-        bool shortfall = AutoTDPWinFps < target - 2 * lowBand;
+        bool shortfall = AutoTDPTrimFps < target - 2 * lowBand;
         bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
         // Intel GPU "load" reads ~100 % whenever the GPU is busy regardless of power (verified on device); it is not a headroom signal
         bool headroom = AutoTDPSlowFps > target + highBand || (AutoTDPCapped && tailClean);
@@ -1272,7 +1280,12 @@ public static class PerformanceManager
             AutoTDPHoldSec = 0;
             AutoTDPDeficitSec += dt;
 
-            if (recentDescent && powerDeficit)
+            // With a limiter the frametimes are flat, so even one moderate long frame (not a storage hitch) right after
+            // a descent step is evidence against the new level: without this, a marginal level that drops a frame
+            // every couple of seconds is re-probed forever, one visible dip per attempt.
+            bool marginalAfterDescent = AutoTDPCapped && AutoTDPLongFrames >= 1 && AutoTDPSevereFrames == 0;
+
+            if (recentDescent && (powerDeficit || marginalAfterDescent))
             {
                 // the level we just stepped down to cannot hold the target: it becomes the floor's lower neighbour
                 AutoTDPFloorW = applied + 1;
@@ -1536,7 +1549,7 @@ public static class PerformanceManager
         AutoTDPFrameCount = 0;
         AutoTDPLastStatCount = 0;
         AutoTDPStaleSec = 0;
-        AutoTDPWinFps = AutoTDPSlowFps = 0;
+        AutoTDPWinFps = AutoTDPTrimFps = AutoTDPSlowFps = 0;
         AutoTDPP95Ratio = 0;
         AutoTDPLongFrames = AutoTDPSevereFrames = 0;
         AutoTDPGpuLoad = null;
@@ -1713,13 +1726,14 @@ public static class PerformanceManager
                     Directory.CreateDirectory(App.LogsPath);
                     string path = Path.Combine(App.LogsPath, $"autotdp-{DateTime.Now:yyyyMMdd-HHmmss-fff}.csv");
                     autoTDPTrace = new StreamWriter(path, false) { AutoFlush = true };
-                    autoTDPTrace.WriteLine("t,fps,slowFps,p95Ratio,longFrames,severeFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key");
+                    autoTDPTrace.WriteLine("t,fps,trimFps,slowFps,p95Ratio,longFrames,severeFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key");
                     LogManager.LogInformation("AutoTDP trace: {0}", path);
                 }
 
                 autoTDPTrace.WriteLine(string.Join(",",
                     now.ToString("F2", CultureInfo.InvariantCulture),
                     AutoTDPWinFps.ToString("F2", CultureInfo.InvariantCulture),
+                    AutoTDPTrimFps.ToString("F2", CultureInfo.InvariantCulture),
                     AutoTDPSlowFps.ToString("F2", CultureInfo.InvariantCulture),
                     AutoTDPP95Ratio.ToString("F3", CultureInfo.InvariantCulture),
                     AutoTDPLongFrames,

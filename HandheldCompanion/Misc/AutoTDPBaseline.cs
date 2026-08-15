@@ -31,10 +31,14 @@ namespace HandheldCompanion.Misc
         /// <summary>CPU package temperature (°C) at the last convergence; used to widen the seed margin on a hot device.</summary>
         public float TemperatureAtConvergence { get; set; }
 
-        /// <summary>Wattage to seed a new session with: the heavier of recent/typical plus a positive margin.</summary>
+        /// <summary>
+        ///     Wattage to seed a new session with: the most recent converged level plus a positive margin. The slow
+        ///     EWMA (<see cref="TypicalWatts"/>) is kept for reference only - anchoring the seed to it would carry an
+        ///     early, still-pessimistic convergence into later sessions.
+        /// </summary>
         public double GetSeedWatts(double marginFloor = 1.0, double marginRatio = 0.10)
         {
-            double basis = Math.Max(RecentWatts, TypicalWatts);
+            double basis = RecentWatts > 0 ? RecentWatts : TypicalWatts;
             return basis + Math.Max(marginFloor, basis * marginRatio);
         }
 
