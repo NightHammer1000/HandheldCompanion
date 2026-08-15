@@ -19,6 +19,7 @@ public static class Settings
     public static readonly string LibraryPageEnabled = "LibraryPageEnabled";
     public static readonly string PerformanceManagerEnabled = "PerformanceManagerEnabled";
     public static readonly string GPUManagementEnabled = "GPUManagementEnabled";
+    public static readonly string AutoTDPTraceEnabled = "AutoTDPTraceEnabled";
 
     public static readonly string OnScreenDisplayRefreshRate = "OnScreenDisplayRefreshRate";
     public static readonly string OnScreenDisplayLevel = "OnScreenDisplayLevel";

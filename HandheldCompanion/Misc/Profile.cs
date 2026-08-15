@@ -236,6 +236,13 @@ public partial class Profile : ICloneable, IComparable, INotifyPropertyChanged
         { 1 /*PowerLineStatus.Online*/, Guid.Empty },
     };
 
+    /// <summary>
+    ///     AutoTDP baselines learned for this profile, keyed by the control configuration they were learned
+    ///     under (executable, power profile, power source, target FPS, efficiency rung and a settings
+    ///     fingerprint — see <c>PerformanceManager</c>). Kept even while AutoTDP is disabled; bounded in size.
+    /// </summary>
+    public Dictionary<string, AutoTDPBaseline> AutoTDPBaselines { get; set; } = new();
+
     public bool GPUScaling { get; set; }
     public int ScalingMode { get; set; } = 0; // default AMD value
     public bool RSREnabled { get; set; }

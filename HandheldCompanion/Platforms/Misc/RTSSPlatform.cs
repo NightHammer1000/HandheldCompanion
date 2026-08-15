@@ -188,6 +188,11 @@ public class RTSSPlatform : IPlatform
         {
             case ProcessFilter.Allowed:
                 break;
+            case ProcessFilter.Desktop:
+                // the game left the foreground; drop the hook so consumers stop reading a backgrounded app entry
+                UnhookProcess(TargetProcessId);
+                TargetProcessId = 0;
+                return;
             default:
                 return;
         }
@@ -289,10 +294,19 @@ public class RTSSPlatform : IPlatform
         return HookedProcessId != 0;
     }
 
+    /// <summary>
+    ///     Re-reads the hooked process' shared-memory entry (full enumeration, ~0.3 ms). Keyed on
+    ///     <see cref="HookedProcessId"/> so an entry that was transiently absent can be re-acquired.
+    /// </summary>
     public void RefreshAppEntry()
     {
-        // refresh appEntry
-        int processId = appEntry is not null ? appEntry.ProcessId : 0;
+        int processId = HookedProcessId;
+        if (processId == 0)
+        {
+            appEntry = null;
+            return;
+        }
+
         try
         {
             appEntry = OSD.GetAppEntries(AppFlags.MASK).FirstOrDefault(a => a.ProcessId == processId);

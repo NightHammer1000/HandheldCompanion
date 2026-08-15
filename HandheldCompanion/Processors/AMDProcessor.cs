@@ -1,5 +1,7 @@
 using HandheldCompanion.Devices;
 using HandheldCompanion.Processors.AMD;
+using HandheldCompanion.Shared;
+using System;
 
 namespace HandheldCompanion.Processors;
 
@@ -30,26 +32,34 @@ public class AMDProcessor : Processor
         IsInitialized = CanChangeTDP || CanChangeGPU;
     }
 
-    public override void SetTDPLimit(PowerType type, double limit, bool immediate, int result)
+    public override bool SetTDPLimit(PowerType type, double limit, bool immediate, int result)
     {
         lock (updateLock)
         {
             if (!CanChangeTDP)
-                return;
+                return false;
 
             if (HasOEMCPU && UseOEM)
             {
                 // get device
                 IDevice device = IDevice.GetCurrent();
 
-                switch (type)
+                try
                 {
-                    case PowerType.Slow:
-                        device.set_long_limit((int)limit);
-                        break;
-                    case PowerType.Fast:
-                        device.set_short_limit((int)limit);
-                        break;
+                    switch (type)
+                    {
+                        case PowerType.Slow:
+                            device.set_long_limit((int)limit);
+                            break;
+                        case PowerType.Fast:
+                            device.set_short_limit((int)limit);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogManager.LogWarning("OEM {0} TDP write failed: {1}", type, ex.Message);
+                    result = -1;
                 }
             }
             else
@@ -69,7 +79,7 @@ public class AMDProcessor : Processor
                 }
             }
 
-            base.SetTDPLimit(type, limit, immediate, result);
+            return base.SetTDPLimit(type, limit, immediate, result);
         }
     }
 

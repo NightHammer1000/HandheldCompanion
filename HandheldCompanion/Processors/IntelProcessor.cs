@@ -1,5 +1,6 @@
 ﻿using HandheldCompanion.Devices;
 using HandheldCompanion.Processors.Intel;
+using HandheldCompanion.Shared;
 using System;
 using static HandheldCompanion.Processors.Intel.KX;
 
@@ -79,23 +80,31 @@ namespace HandheldCompanion.Processors
             return sig;
         }
 
-        public override void SetTDPLimit(PowerType type, double limit, bool immediate, int result)
+        public override bool SetTDPLimit(PowerType type, double limit, bool immediate, int result)
         {
             lock (updateLock)
             {
-                if (!CanChangeTDP) return;
+                if (!CanChangeTDP) return false;
 
                 IDevice device = IDevice.GetCurrent();
 
-                // MSI Claw quirk
-                bool forceOEM = device is ClawA1M claw && claw.GetOverBoost();
+                // MSI Claw quirk: OverBoost forces the OEM path. The flag is a per-boot UEFI value, read once at device open.
+                bool forceOEM = device is ClawA1M claw && claw.GetOverBoostActive();
 
                 if (HasOEMCPU && (UseOEM || forceOEM))
                 {
-                    switch (type)
+                    try
                     {
-                        case PowerType.Slow: device.set_long_limit((int)limit); break;
-                        case PowerType.Fast: device.set_short_limit((int)limit); break;
+                        switch (type)
+                        {
+                            case PowerType.Slow: device.set_long_limit((int)limit); break;
+                            case PowerType.Fast: device.set_short_limit((int)limit); break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogManager.LogWarning("OEM {0} TDP write failed: {1}", type, ex.Message);
+                        result = -1;
                     }
                 }
                 else
@@ -107,7 +116,7 @@ namespace HandheldCompanion.Processors
                     }
                 }
 
-                base.SetTDPLimit(type, limit, immediate, result);
+                return base.SetTDPLimit(type, limit, immediate, result);
             }
         }
 
@@ -126,20 +135,26 @@ namespace HandheldCompanion.Processors
             return (uint)value;
         }
 
-        public void SetMSRLimit(double PL1, double PL2)
+        /// <summary>Whether MSR-based limits are written on this configuration (KX path only; the OEM method has no MSR equivalent).</summary>
+        public bool SupportsMSR => CanChangeTDP && !(HasOEMCPU && UseOEM);
+
+        /// <summary>
+        ///     Writes PL1/PL2 to MSR 0x610 through KX. The OEM path has no MSR equivalent and reports
+        ///     <c>false</c> so callers can skip MSR maintenance entirely when the OEM method is selected.
+        /// </summary>
+        public bool SetMSRLimit(double PL1, double PL2)
         {
             lock (updateLock)
             {
-                if (!CanChangeTDP) return;
+                if (!CanChangeTDP) return false;
 
                 if (HasOEMCPU && UseOEM)
                 {
                     // OEM path if/when implemented
+                    return false;
                 }
-                else
-                {
-                    platform.set_msr_limits((int)PL1, (int)PL2);
-                }
+
+                return platform.set_msr_limits((int)PL1, (int)PL2) == 0;
             }
         }
 

@@ -67,9 +67,15 @@ public class Processor
     public virtual void Stop()
     { }
 
-    public virtual void SetTDPLimit(PowerType type, double limit, bool immediate = false, int result = 0)
+    /// <summary>
+    ///     Applies a TDP limit. Derived processors perform the hardware write and pass the backend result
+    ///     code through; the base logs it and reports success so callers can track what actually landed.
+    /// </summary>
+    /// <returns><c>true</c> when the backend reported success (<paramref name="result"/> == 0).</returns>
+    public virtual bool SetTDPLimit(PowerType type, double limit, bool immediate = false, int result = 0)
     {
         LogManager.LogDebug("User requested {0} TDP limit: {1}W, error code: {2}", type, (uint)limit, result);
+        return result == 0;
     }
 
     public virtual void SetGPUClock(double clock, int result = 0)

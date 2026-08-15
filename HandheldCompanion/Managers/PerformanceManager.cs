@@ -1,10 +1,17 @@
 using HandheldCompanion.Devices;
 using HandheldCompanion.GraphicsProcessingUnit;
 using HandheldCompanion.Misc;
+using HandheldCompanion.Platforms.Misc;
 using HandheldCompanion.Processors;
 using HandheldCompanion.Shared;
 using HandheldCompanion.Utils;
+using RTSSSharedMemoryNET;
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -42,14 +49,77 @@ public enum CPUBoostLevel
     EfficientAgressive = 4,
 }
 
+/// <summary>
+///     Operating state of the AutoTDP controller as surfaced to the UI and OSD.
+/// </summary>
+public enum AutoTDPState
+{
+    /// <summary>The applied power profile has AutoTDP disabled.</summary>
+    Disabled = 0,
+    /// <summary>Enabled, but no valid frame telemetry (no RTSS hook, or frames stopped advancing).</summary>
+    NoTelemetry = 1,
+    /// <summary>Converging on a baseline for the current game/configuration.</summary>
+    Learning = 2,
+    /// <summary>Warm-started from a persisted baseline; tracking around it.</summary>
+    Tracking = 3,
+    /// <summary>Pinned at the maximum wattage and still short of the target.</summary>
+    MaxLimited = 4,
+}
+
+/// <summary>
+///     Immutable snapshot of the AutoTDP controller published on every state or applied-wattage change.
+///     Wattages are the integer values applied to the hardware; <see cref="Fps"/> is the 2 s window mean.
+/// </summary>
+public record AutoTDPStatus(AutoTDPState State, bool Capped, double TargetFps, double Fps, double SetpointW, double AppliedW, double? BaselineW)
+{
+    public static readonly AutoTDPStatus Idle = new(AutoTDPState.Disabled, false, 0, 0, 0, 0, null);
+}
+
 public static class PerformanceManager
 {
     private const short INTERVAL_DEFAULT = 3000; // default interval between value scans
-    private const short INTERVAL_AUTO = 1010; // default interval between value scans for AutoTDP
+    private const short INTERVAL_AUTO = 500; // sampling interval for AutoTDP (actuation is rate-limited separately)
     private const short INTERVAL_DEGRADED = 5000; // degraded interval between value scans
 
     private const int COUNTER_DEFAULT = 3; // default counter value
-    private const int COUNTER_AUTO = 5; // default counter value for AutoTDP
+
+    /*
+     * AutoTDP tuning constants. Time-based windows/dwells are expressed in seconds so that a 30 FPS target
+     * naturally waits proportionally more frames than a 60 FPS one. Wattages are integer quanta.
+     */
+    private const double AUTOTDP_WINDOW_SEC = 2.0;                 // frametime window used for the control signals
+    private const double AUTOTDP_SLOW_TAU_SEC = 1.5;               // EMA time constant for the "slow" fps estimate (downward decisions)
+    private const double AUTOTDP_LOW_BAND_FPS = 0.5;               // below target by more than max(this, 1 %) => short of target
+    private const double AUTOTDP_HIGH_BAND_FPS = 2.0;              // above target by more than max(this, 3 %) => uncapped surplus
+    private const double AUTOTDP_LONGFRAME_RATIO = 1.15;           // a frame longer than target frametime x this counts as a long frame
+    private const int AUTOTDP_LONGFRAME_COUNT = 1;                 // long frames in the window that constitute a deficit
+    private const double AUTOTDP_P95_RATIO = 1.05;                 // p95 frametime above target x this => deficit
+    private const double AUTOTDP_TAIL_CLEAN_RATIO = 1.02;          // p95 frametime at or below target x this => tail is immaculate
+    private const double AUTOTDP_UP_SETTLE_SEC = 1.0;              // minimum spacing between consecutive up-steps
+    private const int AUTOTDP_UP_STEP_W = 1;                       // up-step on a tail-only deficit
+    private const int AUTOTDP_UP_STEP_SHORTFALL_W = 2;             // up-step when the mean fps is clearly short as well
+    private const double AUTOTDP_DOWN_DWELL_INRANGE_SEC = 5.0;     // sustained headroom required before stepping down inside the known range
+    private const double AUTOTDP_DOWN_SETTLE_INRANGE_SEC = 3.0;    // spacing between down-steps inside the known range
+    private const double AUTOTDP_PROBE_DWELL_SEC = 15.0;           // sustained headroom required before probing below the known floor
+    private const double AUTOTDP_PROBE_SETTLE_SEC = 5.0;           // spacing after a probe step
+    private const double AUTOTDP_PROBE_FAIL_WINDOW_SEC = 10.0;     // a deficit within this window after a probe marks the probe as failed
+    private const double AUTOTDP_PROBE_BACKOFF_MAX_SEC = 300.0;    // exponential back-off cap for repeated failed probes
+    private const int AUTOTDP_PROBE_MAX_FAILURES = 3;              // consecutive failed probes after which the floor is locked for the session
+    private const double AUTOTDP_FAST_DOWN_RATIO = 1.5;            // uncapped fps above target x this => 2 W down-steps
+    private const float AUTOTDP_GPU_GATE_PCT = 85.0f;              // do not step down while GPU load is at or above this
+    private const double AUTOTDP_CAP_DETECT_SEC = 10.0;            // fps never above target while tail clean for this long => behaviourally capped
+    private const double AUTOTDP_CAP_STICKY_SEC = 30.0;            // behavioural cap detection stays latched for this long
+    private const double AUTOTDP_WRITE_SPACING_SEC = 1.0;          // minimum spacing between hardware writes
+    private const int AUTOTDP_MAX_STEP_W = 2;                      // maximum change per write, except a jump back to a validated hold level
+    private const int AUTOTDP_MAX_JUMP_W = 4;                      // maximum jump back to the last validated hold level
+    private const double AUTOTDP_HOLD_VALIDATE_SEC = 5.0;          // hold this long without deficit to remember the level as validated
+    private const double AUTOTDP_CONVERGE_SEC = 20.0;              // hold this long at one applied level to converge (Learning -> Tracking)
+    private const double AUTOTDP_MAXLIMITED_SEC = 3.0;             // deficit while pinned at max for this long => MaxLimited
+    private const double AUTOTDP_TELEMETRY_STALE_SEC = 1.0;        // frame counter not advancing for this long => NoTelemetry
+    private const double AUTOTDP_BASELINE_RESAVE_SEC = 60.0;       // minimum spacing between baseline re-serialisations while tracking
+    private const double AUTOTDP_BASELINE_EWMA = 0.5;              // weight of the newest convergence in TypicalWatts
+    private const int AUTOTDP_BASELINE_CAP = 16;                   // maximum baselines kept per game profile (LRU by LastUpdatedUtc)
+    private const int AUTOTDP_FRAME_RING = 1024;                   // matches RTSS's shared-memory ring
 
     private static bool _performanceManagerEnabled = true;
 
@@ -70,17 +140,61 @@ public static class PerformanceManager
     // used to determine relevant TDP and MSR values
     private static Processor? processor;
 
-    // AutoTDP
-    private static bool AutoTDPFirstRun = true;
+    /*
+     * AutoTDP controller state. All fields are touched from the autotdpWatchdog tick (guarded by autotdpLock)
+     * and from PowerProfileManager/RTSS callbacks; hardware writes go through the single serialised writer.
+     */
+
+    // AutoTDP - target, setpoint and actuation
     private static double AutoTDPTargetFPS;
-    private static int AutoTDPFPSSetpointMetCounter;
-    private static int AutoTDPFPSSmallDipCounter;
-    private static readonly double[] FPSHistory = new double[6];
-    private static double ProcessValueFPSPrevious;
-    private static double AutoTDP;
-    private static double AutoTDPPrev;
-    private static double AutoTDPMax;
-    private static bool autotdpWatchdogPendingStop;
+    private static double AutoTDP;                     // continuous setpoint (W)
+    private static double AutoTDPApplied;              // last successfully requested wattage (W, integer quanta)
+    private static double AutoTDPMax;                  // upper bound for this session (manual slider or settings max)
+    private static bool AutoTDPCapped;                 // frame rate cannot overshoot the target (limiter/VSync/behavioural)
+    private static bool AutoTDPCappedByLimiter;
+    private static double AutoTDPCapDetectSec, AutoTDPCapStickyUntilSec;
+    private static readonly Stopwatch AutoTDPClock = Stopwatch.StartNew();
+    private static double AutoTDPLastTickSec, AutoTDPLastWriteSec;
+    private static Task<bool>? pendingTdpWrite;
+    private static int autotdpGeneration;
+    private static readonly SemaphoreSlim tdpWriteLock = new(1, 1);
+
+    // AutoTDP - telemetry (own ring of the most recent frametimes, milliseconds, newest at head-1)
+    private static readonly double[] AutoTDPFrameTimes = new double[AUTOTDP_FRAME_RING];
+    private static int AutoTDPFrameHead, AutoTDPFrameCount;
+    private static uint AutoTDPLastStatCount;
+    private static double AutoTDPStaleSec;
+    private static double AutoTDPWinFps, AutoTDPSlowFps, AutoTDPP95Ratio;
+    private static int AutoTDPLongFrames;
+    private static float? AutoTDPGpuLoad;
+
+    // AutoTDP - dwell / descent memory for the current session
+    private static double AutoTDPHeadroomSec, AutoTDPDeficitSec, AutoTDPHoldSec;
+    private static double AutoTDPUpSettleUntilSec, AutoTDPDownSettleUntilSec;
+    private static double AutoTDPRangeMinW, AutoTDPRangeMaxW;    // lowest level known to hold / heaviest level that cleared a deficit
+    private static double AutoTDPFloorW;                          // lowest level known to hold; descending below it is a cautious probe
+    private static double AutoTDPLastDownSec, AutoTDPDownFromW;   // last down-step: when, and from which level
+    private static bool AutoTDPDownWasProbe, AutoTDPInDeficit;
+    private static double AutoTDPProbeBackoffSec;
+    private static int AutoTDPProbeFailures;
+    private static double AutoTDPConvergeSec, AutoTDPMaxLimitedSec;
+    private static bool AutoTDPConvergedAtLevel;
+    private static double AutoTDPPendingW;
+
+    // AutoTDP - session and persistence
+    private static string AutoTDPSessionId = string.Empty;
+    private static Profile? AutoTDPSessionProfile;
+    private static string AutoTDPBaselineKey = string.Empty;
+    private static AutoTDPBaseline? autoTDPBaseline;
+    private static bool AutoTDPWarm;                              // a baseline was loaded or learned this session (Tracking)
+    private static bool AutoTDPBaselineDirty;
+    private static double AutoTDPBaselineSavedSec;
+
+    // AutoTDP - status and trace
+    private static volatile AutoTDPStatus autoTDPStatus = AutoTDPStatus.Idle;
+    private static StreamWriter? autoTDPTrace;
+    private static bool autoTDPTraceEnabled;
+    private static readonly object autoTDPTraceLock = new();
 
     // powercfg
     private static Guid currentPowerMode = Guid.Empty;
@@ -97,6 +211,7 @@ public static class PerformanceManager
     private static bool tdpWatchdogPendingStop;
     private static readonly double[] CurrentTDP = new double[5] { 0, 0, 0, 0, 0 };  // store current TDP, unused
     private static readonly double[] RequestedTDP = new double[3] { 0, 0, 0 };      // store requested TDP
+    private static readonly double[] RequestedMSR = new double[2] { 0, 0 };         // last successfully written PL1/PL2 via MSR (Intel)
 
     private const string dllName = "WinRing0x64.dll";
 
@@ -155,6 +270,17 @@ public static class PerformanceManager
                 break;
         }
 
+        switch (ManagerFactory.platformManager.Status)
+        {
+            default:
+            case ManagerStatus.Initializing:
+                ManagerFactory.platformManager.Initialized += PlatformManager_Initialized;
+                break;
+            case ManagerStatus.Initialized:
+                QueryPlatform();
+                break;
+        }
+
         IsInitialized = true;
         Initialized?.Invoke(processor?.CanChangeTDP ?? false, processor?.CanChangeGPU ?? false);
 
@@ -180,6 +306,21 @@ public static class PerformanceManager
         QuerySettings();
     }
 
+    private static void PlatformManager_Initialized()
+    {
+        QueryPlatform();
+    }
+
+    private static void QueryPlatform()
+    {
+        // manage events
+        if (PlatformManager.RTSS is not null)
+        {
+            PlatformManager.RTSS.Hooked += RTSS_Hooked;
+            PlatformManager.RTSS.Unhooked += RTSS_Unhooked;
+        }
+    }
+
     private static void QuerySettings()
     {
         // manage events
@@ -189,6 +330,7 @@ public static class PerformanceManager
         SettingsManager_SettingValueChanged("PerformanceManagerEnabled", ManagerFactory.settingsManager.GetString("PerformanceManagerEnabled"), false, false);
         SettingsManager_SettingValueChanged("ConfigurableTDPOverrideDown", ManagerFactory.settingsManager.GetString("ConfigurableTDPOverrideDown"), false, false);
         SettingsManager_SettingValueChanged("ConfigurableTDPOverrideUp", ManagerFactory.settingsManager.GetString("ConfigurableTDPOverrideUp"), false, false);
+        SettingsManager_SettingValueChanged(Settings.AutoTDPTraceEnabled, ManagerFactory.settingsManager.GetString(Settings.AutoTDPTraceEnabled), false, false);
         // AMD
         SettingsManager_SettingValueChanged("RyzenAdjCoAll", ManagerFactory.settingsManager.GetString("RyzenAdjCoAll"), false, false);
         SettingsManager_SettingValueChanged("RyzenAdjCoGfx", ManagerFactory.settingsManager.GetString("RyzenAdjCoGfx"), false, false);
@@ -213,6 +355,10 @@ public static class PerformanceManager
         gfxWatchdog.Stop();
         cpuWatchdog.Stop();
 
+        // flush AutoTDP state
+        AutoTDPEndSession();
+        AutoTDPCloseTrace();
+
         // dismount WinRing0x64.dll, and WinRing0x64.sys hopefully...
         nint Module = GetModuleHandle(dllName);
         if (Module != IntPtr.Zero)
@@ -224,6 +370,12 @@ public static class PerformanceManager
         ManagerFactory.powerProfileManager.Initialized -= PowerProfileManager_Initialized;
         ManagerFactory.settingsManager.SettingValueChanged -= SettingsManager_SettingValueChanged;
         ManagerFactory.settingsManager.Initialized -= SettingsManager_Initialized;
+        ManagerFactory.platformManager.Initialized -= PlatformManager_Initialized;
+        if (PlatformManager.RTSS is not null)
+        {
+            PlatformManager.RTSS.Hooked -= RTSS_Hooked;
+            PlatformManager.RTSS.Unhooked -= RTSS_Unhooked;
+        }
 
         IsInitialized = false;
 
@@ -251,7 +403,8 @@ public static class PerformanceManager
                     {
                         // stop all watchdogs and restore defaults
                         cpuWatchdog.Stop();
-                        StopAutoTDPWatchdog(true);
+                        StopAutoTDPWatchdog();
+                        AutoTDPEndSession();
                         StopTDPWatchdog(true);
                         StopGPUWatchdog(true);
                         RestoreTDP(true);
@@ -295,6 +448,13 @@ public static class PerformanceManager
 
                     if (AutoTDPMax == 0d || AutoTDPMax > TDPMax)
                         AutoTDPMax = TDPMax;
+                }
+                break;
+            case "AutoTDPTraceEnabled":
+                {
+                    autoTDPTraceEnabled = Convert.ToBoolean(value);
+                    if (!autoTDPTraceEnabled)
+                        AutoTDPCloseTrace();
                 }
                 break;
             case "RyzenAdjCoAll":
@@ -352,86 +512,44 @@ public static class PerformanceManager
         if (!_performanceManagerEnabled)
             return;
 
-        if (profile.TDPOverrideEnabled)
-        {
-            if (!profile.AutoTDPEnabled)
-            {
-                // AutoTDP is off and manual TDP is set
-                // Validate TDPOverrideValues before applying
-                if (profile.TDPOverrideValues != null &&
-                    profile.TDPOverrideValues.Length > 0 &&
-                    profile.TDPOverrideValues[0] >= TDPMin)
-                {
-                    // stop AutoTDP watchdog and apply manual TDP
-                    StopAutoTDPWatchdog(true);
-                    RequestTDP(profile.TDPOverrideValues);
+        // manual TDP slider values are valid when present and at or above the configurable minimum
+        bool hasManualTDP = profile.TDPOverrideValues is { Length: > 0 } && profile.TDPOverrideValues[0] >= TDPMin;
+        if (profile.TDPOverrideEnabled && !hasManualTDP)
+            LogManager.LogWarning("Profile {0} has invalid or missing TDP override values, using defaults", profile.Name);
 
-                    if (!tdpWatchdog.Enabled)
-                        StartTDPWatchdog();
-                }
-                else
-                {
-                    // Invalid or missing TDP values, restore default instead
-                    LogManager.LogWarning("Profile {0} has invalid or missing TDP override values, restoring default", profile.Name);
-                    StopAutoTDPWatchdog(true);
-                    RestoreTDP(true);
-                }
-            }
-            else
-            {
-                // Both manual TDP and AutoTDP are on
-                // use AutoTDP watchdog to adjust TDP
-                StopTDPWatchdog(true);
-                RestoreTDP(true);
-            }
-
-            // use manual slider as the starting value
-            // and max limit for AutoTDP
-            if (profile.TDPOverrideValues is not null && profile.TDPOverrideValues.Length > 0)
-            {
-                // Validate TDP value meets minimum threshold
-                double tdpValue = profile.TDPOverrideValues[0];
-                if (tdpValue >= TDPMin)
-                    AutoTDP = AutoTDPMax = tdpValue;
-                else
-                {
-                    // Invalid TDP value, use settings default instead
-                    LogManager.LogWarning("Profile {0} has invalid TDP value {1}W, using settings default", profile.Name, tdpValue);
-                    AutoTDP = AutoTDPMax = ManagerFactory.settingsManager.GetDouble(Settings.ConfigurableTDPOverrideUp);
-                }
-            }
-            else
-            {
-                // TDPOverrideValues is null or empty, use settings default
-                AutoTDP = AutoTDPMax = ManagerFactory.settingsManager.GetDouble(Settings.ConfigurableTDPOverrideUp);
-            }
-        }
-        else
+        if (profile.AutoTDPEnabled)
         {
+            // AutoTDP owns the power rails; the manual slider (when enabled) only caps it
             if (tdpWatchdog.Enabled)
                 StopTDPWatchdog(true);
 
-            if (!profile.AutoTDPEnabled)
-            {
-                if (autotdpWatchdog.Enabled)
-                    StopAutoTDPWatchdog(true);
+            double autoMax = profile.TDPOverrideEnabled && hasManualTDP
+                ? profile.TDPOverrideValues![0]
+                : ManagerFactory.settingsManager.GetDouble(Settings.ConfigurableTDPOverrideUp);
+            if (autoMax <= 0)
+                autoMax = TDPMax;
 
-                // Neither manual TDP nor AutoTDP is enabled, restore default TDP
+            AutoTDPApplyProfile(profile, Math.Clamp(autoMax, TDPMin, TDPMax));
+        }
+        else
+        {
+            StopAutoTDPWatchdog();
+            AutoTDPEndSession();
+
+            if (profile.TDPOverrideEnabled && hasManualTDP)
+            {
+                _ = RequestTDPAsync(profile.TDPOverrideValues!, true, null);
+
+                if (!tdpWatchdog.Enabled)
+                    StartTDPWatchdog();
+            }
+            else
+            {
+                if (tdpWatchdog.Enabled)
+                    StopTDPWatchdog(true);
+
                 RestoreTDP(true);
             }
-
-            // manual TDP override is not set
-            // use the settings max limit for AutoTDP
-            AutoTDP = AutoTDPMax = ManagerFactory.settingsManager.GetInt("ConfigurableTDPOverrideUp");
-        }
-
-        // apply profile defined AutoTDP
-        if (profile.AutoTDPEnabled)
-        {
-            AutoTDPTargetFPS = profile.AutoTDPRequestedFPS;
-
-            if (!autotdpWatchdog.Enabled)
-                StartAutoTDPWatchdog();
         }
 
         // apply profile defined CPU
@@ -499,7 +617,8 @@ public static class PerformanceManager
         // restore default TDP
         if (profile.AutoTDPEnabled)
         {
-            StopAutoTDPWatchdog(true);
+            StopAutoTDPWatchdog();
+            AutoTDPEndSession();
             RestoreTDP(true);
         }
 
@@ -532,14 +651,15 @@ public static class PerformanceManager
         RequestPowerMode(OSPowerMode.BetterPerformance);
     }
 
+    /// <summary>
+    ///     Writes the default power profile's TDP to the hardware. Restores hardware only; the AutoTDP
+    ///     controller's own setpoint is session state and is not touched here.
+    /// </summary>
     private static void RestoreTDP(bool immediate)
     {
-        // On power status change, force refresh TDP and AutoTDP
         PowerProfile profile = ManagerFactory.powerProfileManager.GetDefault();
-        RequestTDP(profile.TDPOverrideValues, immediate);
-
-        if (profile.TDPOverrideValues is not null && profile.TDPOverrideValues.Length > 0)
-            AutoTDP = profile.TDPOverrideValues[0];
+        if (profile.TDPOverrideValues is not null)
+            _ = RequestTDPAsync(profile.TDPOverrideValues, immediate, null);
     }
 
     private static void RestoreCPUClock()
@@ -550,6 +670,257 @@ public static class PerformanceManager
     private static void RestoreGPUClock(bool immediate)
     {
         RequestGPUClock(255 * 50, immediate);
+    }
+
+    #region AutoTDP controller
+
+    /*
+     * AutoTDP controller
+     * ------------------
+     * Sampling runs every INTERVAL_AUTO ms on autotdpWatchdog; hardware writes are rate-limited separately and go
+     * through the single serialised writer (RequestTDPAsync). Telemetry is RTSS's per-frame frametime ring
+     * (AppEntry.StatFrameTimeBuf), copied into a local ring each tick, from which a 2 s window mean, p95 and
+     * long-frame count are derived. Frametime consistency is the primary control variable: a "deficit" fires on
+     * the tail before the mean framerate moves, which is what keeps a limiter-capped target (e.g. 30/30) stable.
+     *
+     * Control law (asymmetric, memory-based):
+     *   deficit  -> step up immediately, never gated by a down-settle. A deficit shortly after a down-step marks
+     *               that descent as failed: the level above becomes the known floor, the setpoint returns to the
+     *               level the descent started from, and further probing below the floor backs off exponentially.
+     *               Inside a session's known heavy range the recovery jumps (bounded) toward the heaviest level
+     *               that has already cleared a deficit, so a wall -> open-world transition costs frames, not seconds.
+     *   headroom -> after a dwell, step down: quickly while above the known floor, cautiously (probe) below it.
+     *               Headroom is a sustained uncapped surplus, or - when the framerate is capped by a limiter/VSync -
+     *               an immaculate frametime tail with the GPU below saturation.
+     *   otherwise-> hold.
+     *
+     * Learning/Tracking are persistence states, not control bounds: Tracking is Learning with a warm start from a
+     * baseline stored on the game's Profile (AutoTDPBaselines). Upward correction is never limited by the stored
+     * range; a heavier scene simply grows the range.
+     *
+     * Threading: the tick owns the controller state under autotdpLock and never blocks on any other lock (profile
+     * locks are TryEnter'd, writes are fire-and-forget). Profile/RTSS callbacks take autotdpLock blocking; they are
+     * short and the tick always releases promptly.
+     */
+
+    private static double AutoTDPNowSec => AutoTDPClock.Elapsed.TotalSeconds;
+
+    /// <summary>Latest AutoTDP status snapshot; safe to read from any thread (e.g. the OSD refresh timer).</summary>
+    public static AutoTDPStatus GetAutoTDPStatus() => autoTDPStatus;
+
+    /// <summary>
+    ///     Discards the learned baseline for the current game/configuration and restarts learning from the
+    ///     session maximum. Bound to the Relearn button on the quick performance page.
+    /// </summary>
+    public static void RelearnAutoTDP()
+    {
+        if (string.IsNullOrEmpty(AutoTDPSessionId))
+            return;
+
+        autotdpLock.Enter();
+        try
+        {
+            Profile? profile = AutoTDPSessionProfile;
+            if (profile is not null && !string.IsNullOrEmpty(AutoTDPBaselineKey))
+            {
+                bool removed;
+                lock (profile.SyncRoot)
+                    removed = profile.AutoTDPBaselines.Remove(AutoTDPBaselineKey);
+
+                if (removed)
+                    ManagerFactory.profileManager.SerializeProfile(profile);
+            }
+
+            autoTDPBaseline = null;
+            AutoTDPBaselineDirty = false;
+            AutoTDPWarm = false;
+
+            Interlocked.Increment(ref autotdpGeneration);
+            AutoTDPResetDwell();
+            AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = 0;
+            AutoTDPProbeFailures = 0;
+            AutoTDPProbeBackoffSec = 0;
+            AutoTDP = AutoTDPMax;
+            AutoTDPApplied = 0; // forces an immediate write of the seed on the next tick
+
+            LogManager.LogInformation("AutoTDP relearn requested for {0}, seeding {1} W", AutoTDPBaselineKey, AutoTDPMax);
+        }
+        finally
+        {
+            autotdpLock.Exit();
+        }
+    }
+
+    /// <summary>
+    ///     Entry point from <see cref="PowerProfileManager_Applied"/>. Starts a new controller session when the
+    ///     game, power profile, power source or fingerprint changed; re-targets softly when only the requested FPS
+    ///     moved (the slider re-applies the profile on every tick); otherwise only refreshes the ceiling.
+    /// </summary>
+    private static void AutoTDPApplyProfile(PowerProfile profile, double autoMax)
+    {
+        string executable = ProcessManager.GetCurrent()?.Executable ?? string.Empty;
+        string sessionId = AutoTDPBuildSessionId(profile, executable);
+        string key = AutoTDPBuildKey(sessionId, profile.AutoTDPRequestedFPS);
+
+        autotdpLock.Enter();
+        try
+        {
+            AutoTDPMax = autoMax;
+
+            bool sameSession = !string.IsNullOrEmpty(AutoTDPSessionId) && string.Equals(sessionId, AutoTDPSessionId, StringComparison.Ordinal);
+            if (!sameSession)
+            {
+                AutoTDPEndSessionCore();
+                AutoTDPBeginSession(sessionId, key, profile.AutoTDPRequestedFPS);
+            }
+            else if (!string.Equals(key, AutoTDPBaselineKey, StringComparison.Ordinal))
+            {
+                AutoTDPRetarget(key, profile.AutoTDPRequestedFPS);
+            }
+            else
+            {
+                AutoTDP = Math.Min(AutoTDP, AutoTDPMax);
+            }
+        }
+        finally
+        {
+            autotdpLock.Exit();
+        }
+
+        if (!autotdpWatchdog.Enabled)
+            StartAutoTDPWatchdog();
+    }
+
+    private static void AutoTDPBeginSession(string sessionId, string key, float targetFps)
+    {
+        Interlocked.Increment(ref autotdpGeneration);
+
+        AutoTDPSessionId = sessionId;
+        AutoTDPSessionProfile = ManagerFactory.profileManager.GetCurrent();
+        AutoTDPTargetFPS = targetFps;
+        AutoTDPApplied = 0;
+        AutoTDPLastWriteSec = 0;
+        AutoTDPLastTickSec = 0;
+        AutoTDPCapped = AutoTDPCappedByLimiter = false;
+        AutoTDPCapDetectSec = AutoTDPCapStickyUntilSec = 0;
+
+        AutoTDPResetTelemetry();
+        AutoTDPResetDwell();
+        AutoTDPLoadBaseline(key);
+        AutoTDPSeedFromBaseline();
+
+        bool hooked = PlatformManager.RTSS?.HasHook() ?? false;
+        if (!hooked)
+            RestoreTDP(true);
+
+        LogManager.LogInformation("AutoTDP session started: key={0}, seed={1} W, max={2} W, warm={3}", key, AutoTDP, AutoTDPMax, AutoTDPWarm);
+        AutoTDPPublish(hooked ? (AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning) : AutoTDPState.NoTelemetry, AutoTDPNowSec, true);
+    }
+
+    private static void AutoTDPRetarget(string key, float targetFps)
+    {
+        AutoTDPSaveBaseline(true);
+
+        AutoTDPTargetFPS = targetFps;
+        AutoTDPCapped = AutoTDPCappedByLimiter = false;
+        AutoTDPCapDetectSec = AutoTDPCapStickyUntilSec = 0;
+
+        AutoTDPResetDwell();
+        AutoTDPLoadBaseline(key);
+
+        // the current level is the only known point for the new target unless a baseline exists
+        if (autoTDPBaseline is null)
+        {
+            double level = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
+            AutoTDPRangeMinW = AutoTDPRangeMaxW = 0;
+            AutoTDPFloorW = 0;
+            AutoTDP = Math.Max(AutoTDP, level);
+        }
+
+        LogManager.LogInformation("AutoTDP re-targeted: key={0}, setpoint={1} W, warm={2}", key, AutoTDP, AutoTDPWarm);
+    }
+
+    /// <summary>Ends the controller session (persisting a dirty baseline) and publishes <see cref="AutoTDPState.Disabled"/>.</summary>
+    private static void AutoTDPEndSession()
+    {
+        if (string.IsNullOrEmpty(AutoTDPSessionId))
+            return;
+
+        autotdpLock.Enter();
+        try
+        {
+            AutoTDPEndSessionCore();
+        }
+        finally
+        {
+            autotdpLock.Exit();
+        }
+    }
+
+    private static void AutoTDPEndSessionCore()
+    {
+        if (string.IsNullOrEmpty(AutoTDPSessionId))
+            return;
+
+        AutoTDPSaveBaseline(true);
+        Interlocked.Increment(ref autotdpGeneration);
+
+        AutoTDPSessionId = string.Empty;
+        AutoTDPSessionProfile = null;
+        AutoTDPBaselineKey = string.Empty;
+        autoTDPBaseline = null;
+        AutoTDPBaselineDirty = false;
+        AutoTDPWarm = false;
+        AutoTDPApplied = 0;
+
+        AutoTDPResetTelemetry();
+        AutoTDPResetDwell();
+        AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = 0;
+        AutoTDPProbeFailures = 0;
+        AutoTDPProbeBackoffSec = 0;
+
+        autoTDPStatus = AutoTDPStatus.Idle;
+        AutoTDPStatusChanged?.Invoke(autoTDPStatus);
+    }
+
+    private static void RTSS_Hooked(AppEntry appEntry)
+    {
+        if (string.IsNullOrEmpty(AutoTDPSessionId))
+            return;
+
+        autotdpLock.Enter();
+        try
+        {
+            // fresh telemetry for the (re)hooked process; resume from the current setpoint, re-applied on the next tick
+            AutoTDPResetTelemetry();
+            AutoTDPResetDwell();
+            AutoTDPApplied = 0;
+            AutoTDPLastWriteSec = 0;
+        }
+        finally
+        {
+            autotdpLock.Exit();
+        }
+    }
+
+    private static void RTSS_Unhooked(int processId)
+    {
+        if (string.IsNullOrEmpty(AutoTDPSessionId))
+            return;
+
+        autotdpLock.Enter();
+        try
+        {
+            AutoTDPSaveBaseline(true);
+            AutoTDPResetTelemetry();
+            AutoTDPApplied = 0;
+            RestoreTDP(true);
+            AutoTDPPublish(AutoTDPState.NoTelemetry, AutoTDPNowSec, true);
+        }
+        finally
+        {
+            autotdpLock.Exit();
+        }
     }
 
     private static void autotdpWatchdog_Elapsed(object? sender, ElapsedEventArgs e)
@@ -564,193 +935,659 @@ public static class PerformanceManager
         if (!ManagerFactory.platformManager.IsReady)
             return;
 
-        bool hasHook = PlatformManager.RTSS?.HasHook() ?? false;
-        if (!hasHook)
-        {
-            autotdpWatchdog.Interval = INTERVAL_DEGRADED;
-            RestoreTDP(true);
+        if (string.IsNullOrEmpty(AutoTDPSessionId))
             return;
+
+        if (!autotdpLock.TryEnter())
+            return;
+
+        try
+        {
+            double now = AutoTDPNowSec;
+            double dt = AutoTDPLastTickSec == 0 ? INTERVAL_AUTO / 1000.0 : Math.Clamp(now - AutoTDPLastTickSec, 0.05, 2.0);
+            AutoTDPLastTickSec = now;
+
+            AutoTDPCollectWrite();
+
+            string reason;
+            if (!AutoTDPSampleTelemetry(dt))
+            {
+                reason = "notelemetry";
+                AutoTDPPublish(AutoTDPState.NoTelemetry, now, false);
+                AutoTDPTrace(now, reason);
+                return;
+            }
+
+            AutoTDPDetectCap(now, dt);
+            reason = AutoTDPStep(now, dt);
+            AutoTDPActuate(now, reason);
+            AutoTDPMaintainMSR();
+            AutoTDPUpdateState(now, dt, reason);
+            AutoTDPTrace(now, reason);
+        }
+        catch (Exception ex)
+        {
+            LogManager.LogWarning("AutoTDP tick failed: {0}", ex.Message);
+        }
+        finally
+        {
+            autotdpLock.Exit();
+        }
+    }
+
+    /// <summary>
+    ///     Pulls new frametime samples from RTSS into the local ring and refreshes the window statistics.
+    ///     Returns <c>false</c> when there is no hook, no entry, or frames stopped advancing for longer than
+    ///     <see cref="AUTOTDP_TELEMETRY_STALE_SEC"/> (loading screens, minimised games, dead hooks).
+    /// </summary>
+    private static bool AutoTDPSampleTelemetry(double dt)
+    {
+        RTSSPlatform? rtss = PlatformManager.RTSS;
+        if (rtss is null || !rtss.HasHook())
+        {
+            AutoTDPStaleSec = AUTOTDP_TELEMETRY_STALE_SEC;
+            return false;
+        }
+
+        rtss.RefreshAppEntry();
+        AppEntry? entry = rtss.GetAppEntry();
+        if (entry?.StatFrameTimeBuf is null || entry.StatFrameTimeBuf.Length < AUTOTDP_FRAME_RING)
+            return false;
+
+        uint count = entry.StatFrameTimeCount;
+        uint delta = unchecked(count - AutoTDPLastStatCount);
+        if (AutoTDPLastStatCount == 0 || delta > (uint)AUTOTDP_FRAME_RING)
+        {
+            // first sample of the session (or a discontinuity): take just enough history for one window
+            int want = (int)Math.Ceiling(AUTOTDP_WINDOW_SEC * Math.Max(30.0, AutoTDPTargetFPS));
+            delta = (uint)Math.Min(Math.Min(count, (uint)AUTOTDP_FRAME_RING), (uint)want);
+        }
+
+        if (delta == 0)
+        {
+            AutoTDPStaleSec += dt;
+            if (AutoTDPStaleSec >= AUTOTDP_TELEMETRY_STALE_SEC)
+                return false;
         }
         else
-            autotdpWatchdog.Interval = INTERVAL_AUTO;
+        {
+            AutoTDPStaleSec = 0;
 
-        if (autotdpLock.TryEnter())
+            // StatFrameTimeBufPos is the next-write slot; the newest sample sits at (pos - 1) & 1023
+            uint pos = entry.StatFrameTimeBufPos;
+            for (uint i = 0; i < delta; i++)
+            {
+                int idx = (int)(unchecked(pos - delta + i) & (AUTOTDP_FRAME_RING - 1));
+                double ft = entry.StatFrameTimeBuf[idx] / 1000.0;
+                if (ft <= 0)
+                    continue;
+
+                AutoTDPFrameTimes[AutoTDPFrameHead] = Math.Min(ft, 1000.0);
+                AutoTDPFrameHead = (AutoTDPFrameHead + 1) & (AUTOTDP_FRAME_RING - 1);
+                if (AutoTDPFrameCount < AUTOTDP_FRAME_RING)
+                    AutoTDPFrameCount++;
+            }
+        }
+
+        AutoTDPLastStatCount = count;
+
+        if (AutoTDPFrameCount == 0)
+            return false;
+
+        AutoTDPComputeWindow(dt);
+
+        GPU? gpu = GPUManager.GetCurrent();
+        AutoTDPGpuLoad = gpu is { IsInitialized: true } && gpu.HasLoad() ? gpu.GetLoad() : null;
+
+        return true;
+    }
+
+    private static readonly double[] AutoTDPWindowScratch = new double[AUTOTDP_FRAME_RING];
+
+    /// <summary>Derives window mean fps, p95 frametime ratio and long-frame count over the last <see cref="AUTOTDP_WINDOW_SEC"/> seconds of frames.</summary>
+    private static void AutoTDPComputeWindow(double dt)
+    {
+        double ftTarget = 1000.0 / Math.Max(1.0, AutoTDPTargetFPS);
+        double windowMs = AUTOTDP_WINDOW_SEC * 1000.0;
+
+        int n = 0;
+        double sum = 0;
+        int longFrames = 0;
+        for (int i = 0; i < AutoTDPFrameCount && n < AUTOTDP_FRAME_RING; i++)
+        {
+            int idx = (AutoTDPFrameHead - 1 - i) & (AUTOTDP_FRAME_RING - 1);
+            double ft = AutoTDPFrameTimes[idx];
+            AutoTDPWindowScratch[n++] = ft;
+            sum += ft;
+            if (ft > ftTarget * AUTOTDP_LONGFRAME_RATIO)
+                longFrames++;
+            if (sum >= windowMs && n >= 8)
+                break;
+        }
+
+        if (n == 0)
+            return;
+
+        AutoTDPWinFps = n / (sum / 1000.0);
+        AutoTDPLongFrames = longFrames;
+
+        Array.Sort(AutoTDPWindowScratch, 0, n);
+        int p95Index = Math.Clamp((int)Math.Ceiling(0.95 * n) - 1, 0, n - 1);
+        AutoTDPP95Ratio = AutoTDPWindowScratch[p95Index] / ftTarget;
+
+        double alpha = 1.0 - Math.Exp(-dt / AUTOTDP_SLOW_TAU_SEC);
+        AutoTDPSlowFps = AutoTDPSlowFps <= 0 ? AutoTDPWinFps : AutoTDPSlowFps + alpha * (AutoTDPWinFps - AutoTDPSlowFps);
+    }
+
+    /// <summary>
+    ///     Decides whether the framerate is capped at the target (frame limiter set at/below it, or observed never
+    ///     to exceed it while pacing is clean - VSync and similar). Capped mode switches the headroom signal from
+    ///     "sustained overshoot" to "immaculate tail + GPU not saturated".
+    /// </summary>
+    private static void AutoTDPDetectCap(double now, double dt)
+    {
+        double target = AutoTDPTargetFPS;
+        double highBand = Math.Max(AUTOTDP_HIGH_BAND_FPS, 0.03 * target);
+        bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
+
+        int limiter = currentProfile?.FramerateValue ?? 0;
+        AutoTDPCappedByLimiter = limiter > 0 && limiter <= target + highBand;
+
+        if (!AutoTDPCappedByLimiter)
+        {
+            if (AutoTDPWinFps > target + 0.5)
+                AutoTDPCapDetectSec = 0;
+            else if (tailClean)
+            {
+                AutoTDPCapDetectSec += dt;
+                if (AutoTDPCapDetectSec >= AUTOTDP_CAP_DETECT_SEC)
+                    AutoTDPCapStickyUntilSec = now + AUTOTDP_CAP_STICKY_SEC;
+            }
+        }
+
+        AutoTDPCapped = AutoTDPCappedByLimiter || now < AutoTDPCapStickyUntilSec;
+    }
+
+    /// <summary>Applies the control law to the setpoint for this tick and returns the decision taken (for the trace/status).</summary>
+    private static string AutoTDPStep(double now, double dt)
+    {
+        double target = AutoTDPTargetFPS;
+        double lowBand = Math.Max(AUTOTDP_LOW_BAND_FPS, 0.01 * target);
+        double highBand = Math.Max(AUTOTDP_HIGH_BAND_FPS, 0.03 * target);
+
+        bool deficit = AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT || AutoTDPP95Ratio > AUTOTDP_P95_RATIO || AutoTDPWinFps < target - lowBand;
+        bool shortfall = AutoTDPWinFps < target - 2 * lowBand;
+        bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
+        bool gpuOk = AutoTDPGpuLoad is null || AutoTDPGpuLoad < AUTOTDP_GPU_GATE_PCT;
+        bool headroom = AutoTDPSlowFps > target + highBand || (AutoTDPCapped && tailClean && gpuOk);
+
+        // before the first successful write the setpoint itself is the best estimate of the applied level
+        double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
+        bool recentDescent = AutoTDPLastDownSec > 0 && now - AutoTDPLastDownSec < AUTOTDP_PROBE_FAIL_WINDOW_SEC;
+        string reason;
+
+        if (deficit)
+        {
+            AutoTDPHeadroomSec = 0;
+            AutoTDPHoldSec = 0;
+            AutoTDPDeficitSec += dt;
+
+            if (recentDescent)
+            {
+                // the level we just stepped down to cannot hold the target: it becomes the floor's lower neighbour
+                AutoTDPFloorW = applied + 1;
+                AutoTDPProbeFailures++;
+                AutoTDPProbeBackoffSec = Math.Min(AUTOTDP_PROBE_BACKOFF_MAX_SEC, AUTOTDP_PROBE_DWELL_SEC * Math.Pow(2, AutoTDPProbeFailures));
+                AutoTDPLastDownSec = 0;
+                AutoTDP = Math.Max(AutoTDP, Math.Max(AutoTDPDownFromW, applied + 1));
+                AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
+                reason = "down-fail";
+                LogManager.LogInformation("AutoTDP: {0} W does not hold {1} FPS, floor {2} W, next probe after {3:F0} s", applied, target, AutoTDPFloorW, AutoTDPProbeBackoffSec);
+            }
+            else if (now >= AutoTDPUpSettleUntilSec)
+            {
+                if (AutoTDPRangeMaxW > applied)
+                {
+                    // a heavier scene we have already handled this session: jump toward its level (bounded)
+                    AutoTDP = Math.Min(AutoTDPRangeMaxW, applied + AUTOTDP_MAX_JUMP_W);
+                    reason = "jump";
+                }
+                else
+                {
+                    AutoTDP = applied + (shortfall ? AUTOTDP_UP_STEP_SHORTFALL_W : AUTOTDP_UP_STEP_W);
+                    reason = shortfall ? "up-shortfall" : "up";
+                }
+                AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
+            }
+            else
+                reason = "up-settle";
+        }
+        else if (headroom)
+        {
+            AutoTDPDeficitSec = 0;
+            AutoTDPHeadroomSec += dt;
+
+            if (AutoTDPLastDownSec > 0 && !recentDescent)
+                AutoTDPDescentSucceeded(applied);
+
+            bool cautious = AutoTDPFloorW > 0 && applied - 1 < AutoTDPFloorW;
+            double dwell = cautious ? Math.Max(AUTOTDP_PROBE_DWELL_SEC, AutoTDPProbeBackoffSec) : AUTOTDP_DOWN_DWELL_INRANGE_SEC;
+            double settle = cautious ? AUTOTDP_PROBE_SETTLE_SEC : AUTOTDP_DOWN_SETTLE_INRANGE_SEC;
+            bool probePending = cautious && recentDescent;
+            bool floorLocked = cautious && AutoTDPProbeFailures >= AUTOTDP_PROBE_MAX_FAILURES;
+
+            if (!probePending && !floorLocked && AutoTDPHeadroomSec >= dwell && now >= AutoTDPDownSettleUntilSec && now >= AutoTDPUpSettleUntilSec && AutoTDP > TDPMin + 0.5)
+            {
+                int step = !cautious && !AutoTDPCapped && AutoTDPSlowFps > AUTOTDP_FAST_DOWN_RATIO * target ? 2 : 1;
+                AutoTDPDownFromW = applied;
+                AutoTDPDownWasProbe = cautious;
+                AutoTDPLastDownSec = now;
+                AutoTDP = applied - step;
+                AutoTDPDownSettleUntilSec = now + settle;
+                reason = cautious ? "probe" : "down";
+            }
+            else
+                reason = floorLocked ? "floor-locked" : probePending ? "probe-wait" : "headroom";
+        }
+        else
+        {
+            AutoTDPHeadroomSec = 0;
+            AutoTDPDeficitSec = 0;
+            AutoTDPHoldSec += dt;
+
+            if (AutoTDPLastDownSec > 0 && !recentDescent)
+                AutoTDPDescentSucceeded(applied);
+
+            if (AutoTDPHoldSec >= AUTOTDP_HOLD_VALIDATE_SEC && !recentDescent)
+            {
+                if (AutoTDPRangeMinW <= 0 || applied < AutoTDPRangeMinW)
+                    AutoTDPRangeMinW = applied;
+            }
+            reason = "hold";
+        }
+
+        // remember the level at which a deficit cleared: that is the heaviest known-good level for this session
+        if (!deficit && AutoTDPInDeficit)
+            AutoTDPRangeMaxW = Math.Max(AutoTDPRangeMaxW, applied);
+        AutoTDPInDeficit = deficit;
+
+        AutoTDP = Math.Clamp(AutoTDP, TDPMin, Math.Max(TDPMin, AutoTDPMax));
+        return reason;
+    }
+
+    private static void AutoTDPDescentSucceeded(double applied)
+    {
+        AutoTDPLastDownSec = 0;
+        if (AutoTDPRangeMinW <= 0 || applied < AutoTDPRangeMinW)
+            AutoTDPRangeMinW = applied;
+
+        if (AutoTDPDownWasProbe)
+        {
+            AutoTDPFloorW = applied;
+            AutoTDPProbeFailures = 0;
+            AutoTDPProbeBackoffSec = 0;
+            LogManager.LogInformation("AutoTDP: probe succeeded, {0} W holds {1} FPS", applied, AutoTDPTargetFPS);
+        }
+    }
+
+    /// <summary>
+    ///     Quantises the setpoint and issues at most one bounded hardware write per <see cref="AUTOTDP_WRITE_SPACING_SEC"/>,
+    ///     never while a previous write is still in flight. Upward moves toward an already-validated level may exceed the
+    ///     normal step cap up to <see cref="AUTOTDP_MAX_JUMP_W"/>.
+    /// </summary>
+    private static void AutoTDPActuate(double now, string reason)
+    {
+        double candidate = Math.Round(AutoTDP, MidpointRounding.AwayFromZero);
+        candidate = Math.Clamp(candidate, TDPMin, Math.Max(TDPMin, AutoTDPMax));
+
+        if (AutoTDPApplied > 0)
+        {
+            double delta = candidate - AutoTDPApplied;
+            double maxUp = reason == "jump" || reason == "down-fail" ? AUTOTDP_MAX_JUMP_W : AUTOTDP_MAX_STEP_W;
+            delta = Math.Clamp(delta, -AUTOTDP_MAX_STEP_W, maxUp);
+            candidate = AutoTDPApplied + delta;
+        }
+
+        if (candidate == AutoTDPApplied)
+            return;
+
+        if (AutoTDPLastWriteSec > 0 && now - AutoTDPLastWriteSec < AUTOTDP_WRITE_SPACING_SEC)
+            return;
+
+        if (pendingTdpWrite is { IsCompleted: false })
+            return;
+
+        int bump = GetProcessor() is IntelProcessor { MicroArch: IntelMicroArch.LunarLake } ? 1 : 0;
+        double pl2 = Math.Min(candidate + bump, TDPMax);
+
+        AutoTDPLastWriteSec = now;
+        AutoTDPPendingW = candidate;
+        pendingTdpWrite = RequestTDPAsync(new[] { candidate, candidate, pl2 }, true, autotdpGeneration);
+    }
+
+    /// <summary>Folds the outcome of the previous write into <see cref="AutoTDPApplied"/>; a failed write is simply retried by the next actuation.</summary>
+    private static void AutoTDPCollectWrite()
+    {
+        if (pendingTdpWrite is not { IsCompleted: true })
+            return;
+
+        bool ok = pendingTdpWrite.Status == TaskStatus.RanToCompletion && pendingTdpWrite.Result;
+        pendingTdpWrite = null;
+
+        if (!ok || AutoTDPPendingW <= 0)
+            return;
+
+        if (AutoTDPApplied != AutoTDPPendingW)
+        {
+            AutoTDPApplied = AutoTDPPendingW;
+            AutoTDPHoldSec = 0;
+            AutoTDPConvergeSec = 0;
+            AutoTDPConvergedAtLevel = false;
+        }
+        AutoTDPPendingW = 0;
+    }
+
+    /// <summary>Keeps MSR 0x610 in step with the requested rails on Intel; skipped entirely on backends without MSR support.</summary>
+    private static void AutoTDPMaintainMSR()
+    {
+        if (processor is not IntelProcessor intel || !intel.SupportsMSR)
+            return;
+
+        double slow = RequestedTDP[(int)PowerType.Slow];
+        double fast = RequestedTDP[(int)PowerType.Fast];
+        if (slow == 0.0d || fast == 0.0d)
+            return;
+
+        if (RequestedMSR[0] != slow || RequestedMSR[1] != fast)
+            RequestMSR(slow, fast);
+    }
+
+    private static void AutoTDPUpdateState(double now, double dt, string reason)
+    {
+        bool deficit = AutoTDPInDeficit;
+        double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
+
+        // pinned at the ceiling and still short: nothing more the controller can do
+        if (deficit && applied >= AutoTDPMax - 0.5)
+            AutoTDPMaxLimitedSec += dt;
+        else
+            AutoTDPMaxLimitedSec = 0;
+
+        // convergence: one applied level, no deficit, for AUTOTDP_CONVERGE_SEC
+        if (deficit)
+            AutoTDPConvergeSec = 0;
+        else if (AutoTDPApplied > 0)
+            AutoTDPConvergeSec += dt;
+
+        if (!AutoTDPConvergedAtLevel && AutoTDPConvergeSec >= AUTOTDP_CONVERGE_SEC && AutoTDPApplied > 0)
+        {
+            AutoTDPConvergedAtLevel = true;
+            AutoTDPOnConverged();
+        }
+
+        AutoTDPState state = AutoTDPMaxLimitedSec >= AUTOTDP_MAXLIMITED_SEC
+            ? AutoTDPState.MaxLimited
+            : AutoTDPWarm ? AutoTDPState.Tracking : AutoTDPState.Learning;
+
+        AutoTDPPublish(state, now, false);
+    }
+
+    private static void AutoTDPOnConverged()
+    {
+        bool first = autoTDPBaseline is null;
+        autoTDPBaseline ??= new AutoTDPBaseline();
+
+        // Min is the lowest level known to hold (the floor, raised by failures, lowered by successful probes);
+        // Max follows the heaviest level that cleared a deficit this session, blended so a one-off spike fades.
+        double level = AutoTDPApplied;
+        double sessionMax = Math.Max(AutoTDPRangeMaxW, level);
+        autoTDPBaseline.RecentWatts = level;
+        autoTDPBaseline.TypicalWatts = autoTDPBaseline.Samples == 0
+            ? level
+            : autoTDPBaseline.TypicalWatts + AUTOTDP_BASELINE_EWMA * (level - autoTDPBaseline.TypicalWatts);
+        autoTDPBaseline.MinWatts = AutoTDPFloorW > 0 ? Math.Min(AutoTDPFloorW, level) : (AutoTDPRangeMinW > 0 ? Math.Min(AutoTDPRangeMinW, level) : level);
+        autoTDPBaseline.MaxWatts = autoTDPBaseline.Samples == 0
+            ? sessionMax
+            : Math.Max(level, autoTDPBaseline.MaxWatts + AUTOTDP_BASELINE_EWMA * (sessionMax - autoTDPBaseline.MaxWatts));
+        autoTDPBaseline.Samples++;
+        autoTDPBaseline.LastUpdatedUtc = DateTime.UtcNow;
+        autoTDPBaseline.TemperatureAtConvergence = PlatformManager.LibreHardware?.GetCPUTemperature() ?? autoTDPBaseline.TemperatureAtConvergence;
+        AutoTDPBaselineDirty = true;
+
+        bool promoted = !AutoTDPWarm;
+        AutoTDPWarm = true;
+
+        LogManager.LogInformation("AutoTDP converged at {0} W for {1} FPS (range {2}-{3} W){4}", level, AutoTDPTargetFPS, autoTDPBaseline.MinWatts, autoTDPBaseline.MaxWatts, promoted ? ", tracking" : string.Empty);
+        AutoTDPSaveBaseline(first || promoted);
+    }
+
+    private static void AutoTDPPublish(AutoTDPState state, double now, bool force)
+    {
+        AutoTDPStatus previous = autoTDPStatus;
+        double applied = AutoTDPApplied;
+        double? baseline = autoTDPBaseline is not null ? autoTDPBaseline.RecentWatts : null;
+
+        AutoTDPStatus status = new(state, AutoTDPCapped, AutoTDPTargetFPS, AutoTDPWinFps, AutoTDP, applied, baseline);
+        autoTDPStatus = status;
+
+        if (force || previous.State != state || previous.AppliedW != applied || previous.Capped != AutoTDPCapped)
+        {
+            if (previous.State != state)
+                LogManager.LogInformation("AutoTDP state: {0} -> {1} ({2} W applied)", previous.State, state, applied);
+
+            AutoTDPStatusChanged?.Invoke(status);
+        }
+    }
+
+    private static void AutoTDPResetTelemetry()
+    {
+        AutoTDPFrameHead = 0;
+        AutoTDPFrameCount = 0;
+        AutoTDPLastStatCount = 0;
+        AutoTDPStaleSec = 0;
+        AutoTDPWinFps = AutoTDPSlowFps = 0;
+        AutoTDPP95Ratio = 0;
+        AutoTDPLongFrames = 0;
+        AutoTDPGpuLoad = null;
+    }
+
+    private static void AutoTDPResetDwell()
+    {
+        AutoTDPHeadroomSec = AutoTDPDeficitSec = AutoTDPHoldSec = 0;
+        AutoTDPUpSettleUntilSec = AutoTDPDownSettleUntilSec = 0;
+        AutoTDPLastDownSec = 0;
+        AutoTDPDownFromW = 0;
+        AutoTDPDownWasProbe = false;
+        AutoTDPInDeficit = false;
+        AutoTDPConvergeSec = 0;
+        AutoTDPConvergedAtLevel = false;
+        AutoTDPMaxLimitedSec = 0;
+        AutoTDPPendingW = 0;
+    }
+
+    private static void AutoTDPSeedFromBaseline()
+    {
+        double seed = AutoTDPMax;
+        if (autoTDPBaseline is not null)
+        {
+            seed = autoTDPBaseline.GetSeedWatts();
+
+            float? temperature = PlatformManager.LibreHardware?.GetCPUTemperature();
+            if (temperature.HasValue && autoTDPBaseline.TemperatureAtConvergence > 0 && temperature.Value - autoTDPBaseline.TemperatureAtConvergence > 10.0f)
+                seed += 1.0;
+        }
+
+        AutoTDP = Math.Clamp(seed, TDPMin, Math.Max(TDPMin, AutoTDPMax));
+    }
+
+    #endregion
+
+    #region AutoTDP persistence
+
+    private static string AutoTDPBuildSessionId(PowerProfile profile, string executable)
+    {
+        int powerLine = (int)System.Windows.Forms.SystemInformation.PowerStatus.PowerLineStatus;
+        return string.Join("|", executable.ToLowerInvariant(), profile.Guid.ToString("N"), powerLine, "r0", AutoTDPFingerprint(profile));
+    }
+
+    private static string AutoTDPBuildKey(string sessionId, float targetFps)
+    {
+        return string.Concat(sessionId, "|", Math.Round(targetFps).ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>Stable 32-bit FNV-1a over the power-profile fields that change the fps/W relationship.</summary>
+    private static string AutoTDPFingerprint(PowerProfile profile)
+    {
+        string source = string.Join(";",
+            ManagerFactory.settingsManager.GetInt("ConfigurableTDPMethod"),
+            TDPMin.ToString(CultureInfo.InvariantCulture),
+            TDPMax.ToString(CultureInfo.InvariantCulture),
+            profile.CPUOverrideEnabled, profile.CPUOverrideValue.ToString(CultureInfo.InvariantCulture),
+            profile.GPUOverrideEnabled, profile.GPUOverrideValue.ToString(CultureInfo.InvariantCulture),
+            (int)profile.CPUBoostLevel,
+            profile.OSPowerMode.ToString("N"),
+            profile.IntelEnduranceGamingEnabled, profile.IntelEnduranceGamingPreset,
+            profile.OEMPowerMode,
+            profile.FramerateValue,
+            (int)profile.CPUParkingMode,
+            profile.CPUCoreEnabled, profile.CPUCoreCount);
+
+        uint hash = 2166136261;
+        foreach (char c in source)
+        {
+            hash ^= c;
+            hash *= 16777619;
+        }
+        return hash.ToString("x8");
+    }
+
+    private static void AutoTDPLoadBaseline(string key)
+    {
+        AutoTDPBaselineKey = key;
+        autoTDPBaseline = null;
+        AutoTDPBaselineDirty = false;
+        AutoTDPWarm = false;
+        AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = 0;
+        AutoTDPProbeFailures = 0;
+        AutoTDPProbeBackoffSec = 0;
+
+        Profile? profile = AutoTDPSessionProfile;
+        if (profile is null)
+            return;
+
+        lock (profile.SyncRoot)
+        {
+            if (profile.AutoTDPBaselines.TryGetValue(key, out AutoTDPBaseline? stored) && stored is not null && stored.Samples > 0)
+                autoTDPBaseline = stored.Clone();
+        }
+
+        if (autoTDPBaseline is null)
+            return;
+
+        AutoTDPWarm = true;
+        AutoTDPRangeMinW = autoTDPBaseline.MinWatts;
+        AutoTDPRangeMaxW = autoTDPBaseline.MaxWatts;
+        AutoTDPFloorW = autoTDPBaseline.MinWatts;
+    }
+
+    /// <summary>
+    ///     Writes the working baseline into the session profile and serialises the profile without re-applying it.
+    ///     The tick calls this with <paramref name="force"/> = false, which respects the re-save spacing; session
+    ///     boundaries force it. Profile locks are only tried, never awaited, so the tick can never deadlock here.
+    /// </summary>
+    private static void AutoTDPSaveBaseline(bool force)
+    {
+        if (autoTDPBaseline is null || !AutoTDPBaselineDirty)
+            return;
+
+        double now = AutoTDPNowSec;
+        if (!force && now - AutoTDPBaselineSavedSec < AUTOTDP_BASELINE_RESAVE_SEC)
+            return;
+
+        Profile? profile = AutoTDPSessionProfile;
+        if (profile is null || string.IsNullOrEmpty(AutoTDPBaselineKey))
+            return;
+
+        if (!Monitor.TryEnter(profile.SyncRoot, 250))
+            return;
+
+        try
+        {
+            profile.AutoTDPBaselines[AutoTDPBaselineKey] = autoTDPBaseline.Clone();
+
+            while (profile.AutoTDPBaselines.Count > AUTOTDP_BASELINE_CAP)
+            {
+                string oldest = profile.AutoTDPBaselines.OrderBy(kv => kv.Value.LastUpdatedUtc).First().Key;
+                profile.AutoTDPBaselines.Remove(oldest);
+            }
+        }
+        finally
+        {
+            Monitor.Exit(profile.SyncRoot);
+        }
+
+        // serialisation clones the profile under its locks and touches the disk; keep it off the controller thread
+        Task.Run(() => ManagerFactory.profileManager.SerializeProfile(profile));
+        AutoTDPBaselineDirty = false;
+        AutoTDPBaselineSavedSec = now;
+    }
+
+    #endregion
+
+    #region AutoTDP trace
+
+    private static void AutoTDPTrace(double now, string reason)
+    {
+        if (!autoTDPTraceEnabled)
+            return;
+
+        lock (autoTDPTraceLock)
         {
             try
             {
-                bool TDPdone = false;
-                bool MSRdone = true;
-                double unclampedProcessValueFPS = 0.0;
-
-                // todo: Store fps for data gathering from multiple points (OSD, Performance)
-                double framerate = PlatformManager.RTSS?.GetFramerate(true) ?? 0.0d;
-                double processValueFPS = unclampedProcessValueFPS = framerate;
-
-                // Ensure realistic process values, prevent divide by 0
-                processValueFPS = Math.Clamp(processValueFPS, 5, 500);
-
-                // Determine error amount, include target, actual and dipper modifier
-                double controllerError = AutoTDPTargetFPS - processValueFPS - AutoTDPDipper(processValueFPS, AutoTDPTargetFPS);
-
-                // Clamp error amount corrected within a single cycle
-                // Adjust clamp if actual FPS is 2.5x requested FPS
-                double clampLowerLimit = processValueFPS >= 2.5 * AutoTDPTargetFPS ? -100 : -5;
-                controllerError = Math.Clamp(controllerError, clampLowerLimit, 15);
-
-                double TDPAdjustment = controllerError * AutoTDP / processValueFPS;
-                TDPAdjustment *= 0.9; // Always have a little undershoot
-
-                // Determine final setpoint
-                if (!AutoTDPFirstRun)
+                if (autoTDPTrace is null)
                 {
-                    AutoTDP += TDPAdjustment + AutoTDPDamper(processValueFPS);
-                }
-                else
-                    AutoTDPFirstRun = false;
-
-                AutoTDP = Math.Clamp(AutoTDP, TDPMin, AutoTDPMax);
-
-                // Only update if we have a different TDP value to set
-                if (AutoTDP != AutoTDPPrev)
-                {
-                    int TDPBump = 0;
-
-                    if (GetProcessor() is IntelProcessor intelProcessor)
-                    {
-                        switch (intelProcessor.MicroArch)
-                        {
-                            // Official specification for Lunar Lake states that PL2 should always be at least 1 W higher than PL1
-                            case IntelMicroArch.LunarLake:
-                                TDPBump = 1;
-                                break;
-                        }
-                    }
-
-                    double[] values = new double[3] { AutoTDP, AutoTDP, AutoTDP + TDPBump };
-                    RequestTDP(values, true);
-                    AutoTDPPrev = AutoTDP;
-
-                    // Reset interval to default after a TDP change
-                    autotdpWatchdog.Interval = INTERVAL_AUTO;
-                }
-                else
-                {
-                    // Reduce interval to 100ms for quicker reaction next time a change is requierd
-                    autotdpWatchdog.Interval = 115;
+                    Directory.CreateDirectory(App.LogsPath);
+                    string path = Path.Combine(App.LogsPath, $"autotdp-{DateTime.Now:yyyyMMdd-HHmmss}.csv");
+                    autoTDPTrace = new StreamWriter(path, false) { AutoFlush = true };
+                    autoTDPTrace.WriteLine("t,fps,slowFps,p95Ratio,longFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key");
                 }
 
-                // are we done ?
-                TDPdone = CurrentTDP[0] == RequestedTDP[0] && CurrentTDP[1] == RequestedTDP[1] && CurrentTDP[2] == RequestedTDP[2];
-
-                // processor specific
-                if (processor is IntelProcessor)
-                {
-                    double TDPslow = RequestedTDP[(int)PowerType.Slow];
-                    double TDPfast = RequestedTDP[(int)PowerType.Fast];
-
-                    if (TDPslow != 0.0d && TDPfast != 0.0d)
-                        // only request an update if current limit is different than stored
-                        if (CurrentTDP[(int)PowerType.MsrSlow] != TDPslow || CurrentTDP[(int)PowerType.MsrFast] != TDPfast)
-                        {
-                            MSRdone = false;
-                            RequestMSR(TDPslow, TDPfast);
-                        }
-                }
-
-                // user requested to halt AutoTDP watchdog
-                if (autotdpWatchdogPendingStop)
-                {
-                    if (autotdpWatchdog.Interval == INTERVAL_AUTO)
-                    {
-                        if (TDPdone && MSRdone)
-                            autotdpWatchdog.Stop();
-                    }
-                    else if (autotdpWatchdog.Interval == INTERVAL_DEGRADED)
-                    {
-                        autotdpWatchdog.Stop();
-                    }
-                }
+                autoTDPTrace.WriteLine(string.Join(",",
+                    now.ToString("F2", CultureInfo.InvariantCulture),
+                    AutoTDPWinFps.ToString("F2", CultureInfo.InvariantCulture),
+                    AutoTDPSlowFps.ToString("F2", CultureInfo.InvariantCulture),
+                    AutoTDPP95Ratio.ToString("F3", CultureInfo.InvariantCulture),
+                    AutoTDPLongFrames,
+                    AutoTDPGpuLoad?.ToString("F0", CultureInfo.InvariantCulture) ?? string.Empty,
+                    AutoTDPCapped ? 1 : 0,
+                    AutoTDP.ToString("F2", CultureInfo.InvariantCulture),
+                    AutoTDPApplied.ToString("F0", CultureInfo.InvariantCulture),
+                    autoTDPStatus.State,
+                    reason,
+                    AutoTDPRangeMinW.ToString("F0", CultureInfo.InvariantCulture),
+                    AutoTDPRangeMaxW.ToString("F0", CultureInfo.InvariantCulture),
+                    AutoTDPFloorW.ToString("F0", CultureInfo.InvariantCulture),
+                    AutoTDPBaselineKey));
             }
-            catch { }
-            finally
+            catch (Exception ex)
             {
-                // release lock
-                autotdpLock.Exit();
+                LogManager.LogWarning("AutoTDP trace failed: {0}", ex.Message);
+                autoTDPTraceEnabled = false;
             }
         }
     }
 
-    private static double AutoTDPDipper(double FPSActual, double FPSSetpoint)
+    private static void AutoTDPCloseTrace()
     {
-        // Dipper
-        // Add small positive "error" if actual and target FPS are similar for a duration
-        double Modifier = 0.0d;
-
-        // Track previous FPS values for average calculation using a rolling array
-        Array.Copy(FPSHistory, 0, FPSHistory, 1, FPSHistory.Length - 1);
-        FPSHistory[0] = FPSActual; // Add current FPS at the start
-
-        // Activate around target range of 1 FPS as games can fluctuate
-        if (FPSSetpoint - 1 <= FPSActual && FPSActual <= FPSSetpoint + 1)
+        lock (autoTDPTraceLock)
         {
-            AutoTDPFPSSetpointMetCounter++;
-
-            // First wait for three seconds of stable FPS arount target, then perform small dip
-            // Reduction only happens if average FPS is on target or slightly below
-            double avg3 = AverageFPSHistory(3);
-            if (AutoTDPFPSSetpointMetCounter >= 3 && AutoTDPFPSSetpointMetCounter < 6 &&
-                FPSSetpoint - 0.5 <= avg3 && avg3 <= FPSSetpoint + 0.1)
-            {
-                AutoTDPFPSSmallDipCounter++;
-                Modifier = FPSSetpoint + 0.5 - FPSActual;
-            }
-            // After three small dips, perform larger dip 
-            // Reduction only happens if average FPS is on target or slightly below
-            else
-            {
-                double avgAll = AverageFPSHistory(FPSHistory.Length);
-                if (AutoTDPFPSSmallDipCounter >= 3 &&
-                    FPSSetpoint - 0.5 <= avgAll && avgAll <= FPSSetpoint + 0.1)
-                {
-                    Modifier = FPSSetpoint + 1.5 - FPSActual;
-                    AutoTDPFPSSetpointMetCounter = 6;
-                }
-            }
+            autoTDPTrace?.Dispose();
+            autoTDPTrace = null;
         }
-        // Perform dips until FPS is outside of limits around target
-        else
-        {
-            Modifier = 0.0;
-            AutoTDPFPSSetpointMetCounter = 0;
-            AutoTDPFPSSmallDipCounter = 0;
-        }
-
-        return Modifier;
     }
 
-    private static double AverageFPSHistory(int count)
-    {
-        double sum = 0;
-        for (int i = 0; i < count; i++)
-            sum += FPSHistory[i];
-        return sum / count;
-    }
-
-    private static double AutoTDPDamper(double FPSActual)
-    {
-        // (PI)D derivative control component to dampen FPS fluctuations
-        if (double.IsNaN(ProcessValueFPSPrevious)) ProcessValueFPSPrevious = FPSActual;
-        double DFactor = -0.1d;
-
-        // Calculation
-        double deltaError = FPSActual - ProcessValueFPSPrevious;
-        double DTerm = deltaError / (INTERVAL_AUTO / 1000.0);
-        double TDPDamping = AutoTDP / FPSActual * DFactor * DTerm;
-
-        ProcessValueFPSPrevious = FPSActual;
-
-        return TDPDamping;
-    }
+    #endregion
 
     private static void cpuWatchdog_Elapsed(object? sender, ElapsedEventArgs e)
     {
@@ -834,19 +1671,7 @@ public static class PerformanceManager
                 TDPdone = CurrentTDP[0] == RequestedTDP[0] && CurrentTDP[1] == RequestedTDP[1] && CurrentTDP[2] == RequestedTDP[2];
 
                 // processor specific
-                if (processor is IntelProcessor)
-                {
-                    double TDPslow = RequestedTDP[(int)PowerType.Slow];
-                    double TDPfast = RequestedTDP[(int)PowerType.Fast];
-
-                    if (TDPslow != 0.0d && TDPfast != 0.0d)
-                        // only request an update if current limit is different than stored
-                        if (CurrentTDP[(int)PowerType.MsrSlow] != TDPslow || CurrentTDP[(int)PowerType.MsrFast] != TDPfast)
-                        {
-                            MSRdone = false;
-                            RequestMSR(TDPslow, TDPfast);
-                        }
-                }
+                AutoTDPMaintainMSR();
 
                 // user requested to halt TDP watchdog
                 if (tdpWatchdogPendingStop)
@@ -978,26 +1803,34 @@ public static class PerformanceManager
 
     private static void StartAutoTDPWatchdog()
     {
-        autotdpWatchdogPendingStop = false;
+        AutoTDPLastTickSec = 0;
         autotdpWatchdog.Interval = INTERVAL_AUTO;
         autotdpWatchdog.Start();
     }
 
-    private static void StopAutoTDPWatchdog(bool immediate = false)
+    private static void StopAutoTDPWatchdog()
     {
-        autotdpWatchdogPendingStop = true;
-        if (immediate)
-            autotdpWatchdog.Stop();
+        autotdpWatchdog.Stop();
     }
 
-    private static void RequestTDP(PowerType type, double value, bool immediate = false)
+    /// <summary>Whether a rail is actually written on this processor (Intel has no STAPM rail).</summary>
+    private static bool IsRailWritten(PowerType type)
+    {
+        return !(processor is IntelProcessor && type == PowerType.Stapm);
+    }
+
+    /// <summary>
+    ///     Records the requested value for one rail and, when <paramref name="immediate"/>, writes it.
+    ///     Returns <c>true</c> when the value was accepted (stored, or written and acknowledged by the backend).
+    /// </summary>
+    private static bool RequestTDP(PowerType type, double value, bool immediate = false)
     {
         // make sure we're not trying to run below or above specs
         value = Math.Min(TDPMax, Math.Max(TDPMin, value));
 
         // skip if value is invalid
         if (value == 0 || double.IsNaN(value) || double.IsInfinity(value))
-            return;
+            return false;
 
         // update value read by timer
         int idx = (int)type;
@@ -1005,52 +1838,92 @@ public static class PerformanceManager
 
         // skip if processor is not ready
         if (processor is null || !processor.IsInitialized)
-            return;
+            return false;
 
-        // immediately apply
-        if (immediate)
-        {
-            // TODO: Implement proper TDP reading
-            // CurrentTDP[idx] = value;
+        if (!immediate)
+            return true;
 
-            if (processor is IntelProcessor)
-                // Intel doesn't have stapm
-                if (type == PowerType.Stapm)
-                    return;
+        // TODO: Implement proper TDP reading
+        // CurrentTDP[idx] = value;
 
-            processor.SetTDPLimit((PowerType)idx, value, immediate);
-        }
+        if (!IsRailWritten(type))
+            return true;
+
+        return processor.SetTDPLimit(type, value, immediate);
     }
 
-    private static async void RequestTDP(double[] values, bool immediate = false)
+    /// <summary>
+    ///     Single serialised writer for a full rail set (Slow, Stapm, Fast). Rails are written in order with a short
+    ///     pause only between rails that are actually written; concurrent callers queue behind <see cref="tdpWriteLock"/>
+    ///     so rail sequences never interleave. A <paramref name="generation"/> ties the write to an AutoTDP session:
+    ///     if the session changes mid-sequence the remaining rails are abandoned. <c>null</c> writes unconditionally.
+    /// </summary>
+    /// <returns><c>true</c> when every written rail was acknowledged by the backend.</returns>
+    private static async Task<bool> RequestTDPAsync(double[] values, bool immediate, int? generation)
     {
         // Handle null or insufficient array scenario
         if (values == null || values.Length <= (int)PowerType.Fast)
-            return;
+            return false;
 
-        for (int idx = (int)PowerType.Slow; idx <= (int)PowerType.Fast; idx++)
+        await tdpWriteLock.WaitAsync().ConfigureAwait(false);
+        try
         {
-            RequestTDP((PowerType)idx, values[idx], immediate);
-            await Task.Delay(200).ConfigureAwait(false); // Avoid blocking the synchronization context
+            bool success = true;
+            bool wroteAny = false;
+
+            for (int idx = (int)PowerType.Slow; idx <= (int)PowerType.Fast; idx++)
+            {
+                if (generation.HasValue && generation.Value != autotdpGeneration)
+                    return false;
+
+                PowerType type = (PowerType)idx;
+                if (!IsRailWritten(type))
+                {
+                    RequestTDP(type, values[idx], false);
+                    continue;
+                }
+
+                if (wroteAny)
+                    await Task.Delay(200).ConfigureAwait(false);
+
+                success &= RequestTDP(type, values[idx], immediate);
+                wroteAny = true;
+            }
+
+            return success;
+        }
+        catch (Exception ex)
+        {
+            LogManager.LogWarning("TDP write failed: {0}", ex.Message);
+            return false;
+        }
+        finally
+        {
+            tdpWriteLock.Release();
         }
     }
 
-    private static void RequestMSR(double PL1, double PL2)
+    /// <summary>Writes PL1/PL2 to MSR 0x610 on Intel and remembers the last acknowledged pair in <see cref="RequestedMSR"/>.</summary>
+    private static bool RequestMSR(double PL1, double PL2)
     {
         if (processor is null || !processor.IsInitialized)
-            return;
+            return false;
 
-        if (processor is IntelProcessor)
+        if (processor is not IntelProcessor intel)
+            return false;
+
+        // make sure we're not trying to run below or above specs
+        double TDPslow = Math.Min(TDPMax, Math.Max(TDPMin, PL1));
+        double TDPfast = Math.Min(TDPMax, Math.Max(TDPMin, PL2));
+
+        bool success = intel.SetMSRLimit(TDPslow, TDPfast);
+        if (success)
         {
-            // make sure we're not trying to run below or above specs
-            double TDPslow = Math.Min(TDPMax, Math.Max(TDPMin, PL1));
-            double TDPfast = Math.Min(TDPMax, Math.Max(TDPMin, PL2));
-
-            // TODO: Implement proper TDP reading
-            // CurrentTDP[(int)PowerType.MsrSlow] = TDPslow;
-            // CurrentTDP[(int)PowerType.MsrFast] = TDPfast;
-            ((IntelProcessor)processor).SetMSRLimit(TDPslow, TDPfast);
+            RequestedMSR[0] = TDPslow;
+            RequestedMSR[1] = TDPfast;
         }
+
+        return success;
     }
 
     private static void RequestGPUClock(double value, bool immediate = false)
@@ -1314,6 +2187,10 @@ public static class PerformanceManager
 
     public static event EPPChangedEventHandler? EPPChanged;
     public delegate void EPPChangedEventHandler(uint EPP);
+
+    /// <summary>Raised when the AutoTDP state, applied wattage or capped flag changes (not on every sample). May fire on a threadpool thread.</summary>
+    public static event AutoTDPStatusChangedEventHandler? AutoTDPStatusChanged;
+    public delegate void AutoTDPStatusChangedEventHandler(AutoTDPStatus status);
 
     #endregion
 }

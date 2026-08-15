@@ -16,9 +16,16 @@ public class WidgetFactory
         {"GPU", new GpuWidget()}
     };
 
+    /// <summary>
+    ///     Builds the widget registered under <paramref name="key"/>. Keys are matched case-insensitively
+    ///     because the persisted <c>OnScreenDisplayOrder</c> setting is user-authored (its default contains "Time").
+    /// </summary>
     public static void CreateWidget(string key, OverlayEntry entry, short? level = null)
     {
-        if (!Widgets.TryGetValue(key, out IWidget? widget))
+        if (string.IsNullOrWhiteSpace(key))
+            return;
+
+        if (!Widgets.TryGetValue(key.Trim().ToUpperInvariant(), out IWidget? widget))
             return;
 
         widget.Build(entry, level);

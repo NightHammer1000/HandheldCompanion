@@ -146,6 +146,9 @@ public class ClawA1M : IDevice
     private bool ClawOpen = false;
     public override bool IsOpen => DeviceOpen && ClawOpen;
 
+    // OverBoost state captured at Open(); the UEFI flag only changes across a reboot (see SetOverBoost)
+    private bool? overBoostActive;
+
     private static readonly DeviceVersion[] deviceVersions =
     {
         // MS-1T41
@@ -307,6 +310,9 @@ public class ClawA1M : IDevice
         byte[] box = GetMsiDCVarData(ref uefiVariableEx);
         if (uefiVariableEx != 0)
         {
+            // the enabled flag only takes effect after a reboot, so the value read here is authoritative for this session
+            overBoostActive = box[6] != 0;
+
             if (box[1] == 0)
             {
                 InitOverBoost(true);
@@ -545,6 +551,17 @@ public class ClawA1M : IDevice
         if (uefiVariableEx != 0)
             return box[6] != 0;
         return false;
+    }
+
+    /// <summary>
+    ///     OverBoost state effective for this boot, cached at <see cref="Open"/>. Use this on hot paths
+    ///     (per-write TDP decisions); <see cref="GetOverBoost"/> reads the UEFI variable live and reflects a
+    ///     pending change that only applies after restart.
+    /// </summary>
+    public bool GetOverBoostActive()
+    {
+        overBoostActive ??= GetOverBoost();
+        return overBoostActive.Value;
     }
 
     public bool GetOverBoostSup()

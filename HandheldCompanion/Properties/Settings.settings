@@ -413,6 +413,9 @@
     <Setting Name="PerformanceManagerEnabled" Type="System.Boolean" Scope="User">
       <Value Profile="(Default)">True</Value>
     </Setting>
+    <Setting Name="AutoTDPTraceEnabled" Type="System.Boolean" Scope="User">
+      <Value Profile="(Default)">False</Value>
+    </Setting>
     <Setting Name="GPUManagementEnabled" Type="System.Boolean" Scope="User">
       <Value Profile="(Default)">True</Value>
     </Setting>

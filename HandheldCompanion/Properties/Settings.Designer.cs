@@ -1665,7 +1665,19 @@ namespace HandheldCompanion.Properties
                 this["PerformanceManagerEnabled"] = value;
             }
         }
-        
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool AutoTDPTraceEnabled {
+            get {
+                return ((bool)(this["AutoTDPTraceEnabled"]));
+            }
+            set {
+                this["AutoTDPTraceEnabled"] = value;
+            }
+        }
+
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
         [global::System.Configuration.DefaultSettingValueAttribute("True")]
