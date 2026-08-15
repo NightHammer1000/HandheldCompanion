@@ -383,6 +383,32 @@ namespace HandheldCompanion.ViewModels
             }
         }
 
+        /// <summary>Live AutoTDP controller status for the currently running session (not preset-specific).</summary>
+        public string AutoTDPStatusText
+        {
+            get
+            {
+                AutoTDPStatus status = PerformanceManager.GetAutoTDPStatus();
+                switch (status.State)
+                {
+                    case AutoTDPState.NoTelemetry:
+                        return Resources.ProfilesPage_AutoTDPStatusNoTelemetry;
+                    case AutoTDPState.Learning:
+                        return string.Format(Resources.ProfilesPage_AutoTDPStatusLearning, status.AppliedW);
+                    case AutoTDPState.Tracking:
+                        return string.Format(Resources.ProfilesPage_AutoTDPStatusTracking, status.BaselineW ?? status.AppliedW, status.AppliedW);
+                    case AutoTDPState.MaxLimited:
+                        return string.Format(Resources.ProfilesPage_AutoTDPStatusLimited, status.AppliedW);
+                    default:
+                        return Resources.ProfilesPage_AutoTDPStatusIdle;
+                }
+            }
+        }
+
+        public bool CanRelearnAutoTDP => PerformanceManager.GetAutoTDPStatus().State is not AutoTDPState.Disabled;
+
+        public ICommand RelearnAutoTDPCommand { get; private set; } = new DelegateCommand(PerformanceManager.RelearnAutoTDP);
+
         public int FrameLimitMaximum
         {
             get
@@ -868,6 +894,10 @@ namespace HandheldCompanion.ViewModels
             nameof(ConfigurableTDPOverrideUp),
             nameof(SupportsTDP),
 
+            // AutoTDP live status (controller state, not preset data)
+            nameof(AutoTDPStatusText),
+            nameof(CanRelearnAutoTDP),
+
             // UI state (display-only or indirect updates)
             nameof(SelectedPresetPicker),
             nameof(ProfilePickerItems),
@@ -1321,6 +1351,7 @@ namespace HandheldCompanion.ViewModels
                 ManagerFactory.multimediaManager.PrimaryScreenChanged -= MultimediaManager_PrimaryScreenChanged;
                 ManagerFactory.multimediaManager.Initialized -= MultimediaManager_Initialized;
                 PerformanceManager.EPPChanged -= PerformanceManager_EPPChanged;
+                PerformanceManager.AutoTDPStatusChanged -= PerformanceManager_AutoTDPStatusChanged;
                 PerformanceManager.Initialized -= PerformanceManager_Initialized;
                 ManagerFactory.powerProfileManager.Updated -= PowerProfileManager_Updated;
                 ManagerFactory.powerProfileManager.Deleted -= PowerProfileManager_Deleted;
@@ -1399,15 +1430,24 @@ namespace HandheldCompanion.ViewModels
         {
             // manage events
             PerformanceManager.EPPChanged += PerformanceManager_EPPChanged;
+            PerformanceManager.AutoTDPStatusChanged += PerformanceManager_AutoTDPStatusChanged;
 
             OnPropertyChanged(nameof(SupportsTDP));
             OnPropertyChanged(nameof(SupportsGPUFreq));
+            OnPropertyChanged(nameof(AutoTDPStatusText));
+            OnPropertyChanged(nameof(CanRelearnAutoTDP));
         }
 
         private void PerformanceManager_EPPChanged(uint epp)
         {
             if (SelectedPreset is not null)
                 EPPOverrideValue = epp;
+        }
+
+        private void PerformanceManager_AutoTDPStatusChanged(AutoTDPStatus status)
+        {
+            OnPropertyChanged(nameof(AutoTDPStatusText));
+            OnPropertyChanged(nameof(CanRelearnAutoTDP));
         }
 
         private void PowerProfileManager_Updated(PowerProfile preset, UpdateSource source)

@@ -175,6 +175,20 @@
                                 Value="{Binding AutoTDPRequestedFPS, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                         </DockPanel>
                     </ui:SettingsCard>
+
+                    <!--  Auto TDP status + relearn  -->
+                    <ui:SettingsCard
+                        Description="{l:Static resx:Resources.ProfilesPage_AutoTDPRelearnDesc}"
+                        Header="{Binding AutoTDPStatusText, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}"
+                        IsEnabled="{Binding AutoTDPEnabled, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}">
+                        <Button
+                            VerticalAlignment="Center"
+                            Command="{Binding RelearnAutoTDPCommand}"
+                            IsEnabled="{Binding CanRelearnAutoTDP, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}"
+                            Style="{DynamicResource AccentButtonStyle}">
+                            <TextBlock Text="{l:Static resx:Resources.ProfilesPage_AutoTDPRelearn}" />
+                        </Button>
+                    </ui:SettingsCard>
                 </ui:SettingsExpander.Items>
             </ui:SettingsExpander>
 

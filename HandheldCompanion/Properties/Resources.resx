@@ -1164,6 +1164,33 @@ Motion input toggle: press selected button(s) to switch motion state.</value>
   <data name="ProfilesPage_AutoTDPFPS" xml:space="preserve">
     <value>Framerate target</value>
   </data>
+  <data name="ProfilesPage_AutoTDPStatus" xml:space="preserve">
+    <value>Controller status</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusDesc" xml:space="preserve">
+    <value>Live state of the automatic TDP controller for the running game</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusIdle" xml:space="preserve">
+    <value>Inactive</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusNoTelemetry" xml:space="preserve">
+    <value>Waiting for frame data</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusLearning" xml:space="preserve">
+    <value>Learning · {0:0} W</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusTracking" xml:space="preserve">
+    <value>Tracking · baseline {0:0} W · now {1:0} W</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusLimited" xml:space="preserve">
+    <value>Limited · {0:0} W (maximum reached)</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPRelearn" xml:space="preserve">
+    <value>Relearn</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPRelearnDesc" xml:space="preserve">
+    <value>Discard the learned baseline for this game and start over from the maximum</value>
+  </data>
   <data name="ProfilesPage_AutoTDPFPSDesc" xml:space="preserve">
     <value>Desired FPS target value for automatic TDP controller</value>
   </data>

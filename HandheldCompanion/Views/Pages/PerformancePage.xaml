@@ -369,6 +369,17 @@
                                             Value="{Binding AutoTDPRequestedFPS, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                     </DockPanel>
                                 </ui:SettingsCard>
+
+                                <!--  Auto TDP status (read-only here: a preset is shared by many games)  -->
+                                <ui:SettingsCard
+                                    Description="{l:Static resx:Resources.ProfilesPage_AutoTDPStatusDesc}"
+                                    Header="{l:Static resx:Resources.ProfilesPage_AutoTDPStatus}"
+                                    IsEnabled="{Binding AutoTDPEnabled, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}">
+                                    <TextBlock
+                                        VerticalAlignment="Center"
+                                        Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                        Text="{Binding AutoTDPStatusText, Mode=OneWay, UpdateSourceTrigger=PropertyChanged}" />
+                                </ui:SettingsCard>
                             </ui:SettingsExpander.Items>
                         </ui:SettingsExpander>
 

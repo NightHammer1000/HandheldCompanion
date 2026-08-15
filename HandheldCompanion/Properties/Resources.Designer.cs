@@ -8929,7 +8929,88 @@ namespace HandheldCompanion.Properties {
                 return ResourceManager.GetString("ProfilesPage_AutoTDPFPS", resourceCulture);
             }
         }
-        
+
+        /// <summary>
+        ///   Looks up a localized string similar to Controller status.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatus {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatus", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Live state of the automatic TDP controller for the running game.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusDesc {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusDesc", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Inactive.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusIdle {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusIdle", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Waiting for frame data.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusNoTelemetry {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusNoTelemetry", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Learning · {0:0} W.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusLearning {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusLearning", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Tracking · baseline {0:0} W · now {1:0} W.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusTracking {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusTracking", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Limited · {0:0} W (maximum reached).
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusLimited {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusLimited", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Relearn.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPRelearn {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPRelearn", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Discard the learned baseline for this game and start over from the maximum.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPRelearnDesc {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPRelearnDesc", resourceCulture);
+            }
+        }
+
         /// <summary>
         ///   Looks up a localized string similar to Desired FPS target value for automatic TDP controller.
         /// </summary>
