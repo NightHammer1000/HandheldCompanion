@@ -67,12 +67,27 @@ public enum AutoTDPState
 }
 
 /// <summary>
+///     Detailed phase of the continuously learning AutoTDP controller. <see cref="AutoTDPState"/> remains the
+///     compact public state; this phase explains what kind of evidence the controller is currently collecting.
+/// </summary>
+public enum AutoTDPLearningPhase
+{
+    None = 0,
+    WaitingForTarget = 1,
+    CoarseDown = 2,
+    CoarseRecover = 3,
+    FineFloor = 4,
+    ContentCapped = 5,
+    Tracking = 6,
+}
+
+/// <summary>
 ///     Immutable snapshot of the AutoTDP controller published on every state or applied-wattage change.
 ///     Wattages are the integer values applied to the hardware; <see cref="Fps"/> is the 2 s window mean.
 /// </summary>
-public record AutoTDPStatus(AutoTDPState State, bool Capped, double TargetFps, double Fps, double SetpointW, double AppliedW, double? BaselineW, double RangeMinW, double RangeMaxW, string EfficiencyRung, bool Optimizing)
+public record AutoTDPStatus(AutoTDPState State, AutoTDPLearningPhase Phase, bool Capped, double? ContentCapFps, double TargetFps, double Fps, double SetpointW, double AppliedW, double? BaselineW, double RangeMinW, double RangeMaxW, string EfficiencyRung, bool Optimizing)
 {
-    public static readonly AutoTDPStatus Idle = new(AutoTDPState.Disabled, false, 0, 0, 0, 0, null, 0, 0, string.Empty, false);
+    public static readonly AutoTDPStatus Idle = new(AutoTDPState.Disabled, AutoTDPLearningPhase.None, false, null, 0, 0, 0, 0, null, 0, 0, string.Empty, false);
 }
 
 public static class PerformanceManager
@@ -99,10 +114,10 @@ public static class PerformanceManager
     private const double AUTOTDP_UNCAPPED_NEAR_RATIO = 1.1;        // uncapped: tail rules only apply while the mean is within this factor of the target
     private const double AUTOTDP_TAIL_CLEAN_RATIO = 1.02;          // p95 frametime at or below target x this => tail is immaculate
     private const double AUTOTDP_UP_SETTLE_SEC = 1.0;              // minimum spacing between consecutive up-steps
-    private const int AUTOTDP_UP_STEP_W = 1;                       // up-step for a tail-only deficit or a stutter
-    private const double AUTOTDP_UP_GAIN_REL = 0.05;               // +1 W per this fraction of the target the mean is short (60 fps: +1 W per 3 fps)
-    private const int AUTOTDP_UP_STEP_MAX_W = 4;                   // cap on a single proportional up-step
-    private const double AUTOTDP_STUTTER_SPACING_SEC = 8.0;        // one stutter step per this many seconds (a hitch spans several ticks; loading screens stream)
+    private const double AUTOTDP_DEFICIT_DWELL_SEC = 1.5;          // a non-probe FPS/frametime deficit must persist before it earns one watt
+    private const int AUTOTDP_UP_STEP_W = 1;                       // minimum coarse target-acquisition/recovery step
+    private const double AUTOTDP_UP_GAIN_REL = 0.05;               // coarse target acquisition: +1 W per this fraction short
+    private const int AUTOTDP_UP_STEP_MAX_W = 4;                   // cap for coarse target acquisition only
     private const double AUTOTDP_DOWN_DWELL_INRANGE_SEC = 5.0;     // sustained headroom required before stepping down inside the known range
     private const double AUTOTDP_DOWN_SETTLE_INRANGE_SEC = 3.0;    // spacing between down-steps inside the known range
     private const double AUTOTDP_PROBE_DWELL_SEC = 15.0;           // sustained headroom required before probing below the known floor
@@ -114,6 +129,7 @@ public static class PerformanceManager
     private const double AUTOTDP_STRIKE_DWELL_SEC = 10.0;          // clean time required at the level above before a struck level is attempted again
     private const int AUTOTDP_SCENE_CHANGE_W = 2;                  // a booked failure whose deficit only clears this far above the level stepped down from was a scene change, not the level
     private const double AUTOTDP_FLOOR_REVALIDATE_SEC = 300.0;     // quiet time before a learned (locked) floor is probed once more per session
+    private const double AUTOTDP_FLOOR_REVALIDATE_MAX_SEC = 1800.0;// repeated failures back off continuous revalidation to 30 minutes
     private const double AUTOTDP_FAST_DOWN_RATIO = 1.5;            // uncapped fps above target x this => 2 W down-steps, short dwell/settle
     private const double AUTOTDP_FASTER_DOWN_RATIO = 2.0;          // uncapped fps above target x this => 4 W down-steps
     private const int AUTOTDP_DOWN_STEP_FAST_W = 2;
@@ -135,6 +151,28 @@ public static class PerformanceManager
     private const double AUTOTDP_BASELINE_RANGE_BIAS = 0.25;       // baseline = min + this x (max - min) once the range is complete (middle of the range, 50 % bias to the floor)
     private const int AUTOTDP_BASELINE_CAP = 16;                   // maximum baselines kept per game profile (LRU by LastUpdatedUtc)
     private const int AUTOTDP_FRAME_RING = 1024;                   // matches RTSS's shared-memory ring
+
+    // Staged cold learning: broad FPS-only bracket first, frametime-aware floor search second.
+    private const int AUTOTDP_COARSE_DOWN_STEP_W = 4;
+    private const int AUTOTDP_COARSE_RECOVER_STEP_W = 2;
+    private const double AUTOTDP_COARSE_WINDOW_SEC = 1.8;
+    private const double AUTOTDP_COARSE_READY_SEC = 2.0;
+    private const double AUTOTDP_COARSE_STABLE_SEC = 3.0;
+    private const double AUTOTDP_COARSE_AMBIGUOUS_SEC = 4.0;
+    private const double AUTOTDP_COARSE_FAIL_FPS = 1.5;
+    private const double AUTOTDP_COARSE_FAIL_REL = 0.03;
+
+    // Lower content caps and scene changes are detected from robust per-frame cadence, never from target-relative p95.
+    private const double AUTOTDP_SCENE_DROP_REL = 0.15;
+    private const double AUTOTDP_CONTENT_CAP_BELOW_REL = 0.08;
+    private const double AUTOTDP_CONTENT_CAP_STABLE_REL = 0.02;
+    private const double AUTOTDP_CONTENT_CAP_SPREAD = 0.10;
+    private const double AUTOTDP_CONTENT_CAP_DETECT_SEC = 3.0;
+    private const double AUTOTDP_CONTENT_CAP_PROBE_SEC = 2.0;
+    private const double AUTOTDP_CONTENT_CAP_EXIT_SEC = 1.0;
+    private const double AUTOTDP_CONTENT_CAP_EXIT_REL = 0.05;
+    private const double AUTOTDP_CONTENT_CAP_RESPONSE_FPS = 1.0;
+    private const double AUTOTDP_CONTENT_CAP_RESPONSE_REL = 0.03;
 
     private static bool _performanceManagerEnabled = true;
 
@@ -180,6 +218,7 @@ public static class PerformanceManager
     private static uint AutoTDPLastStatCount;
     private static double AutoTDPStaleSec;
     private static double AutoTDPWinFps, AutoTDPTrimFps, AutoTDPSlowFps, AutoTDPP95Ratio;   // TrimFps excludes frames > 2x target (storage hitches) from the mean
+    private static double AutoTDPWindowSec, AutoTDPP05Ms, AutoTDPMedianMs, AutoTDPP95Ms, AutoTDPMedianFps, AutoTDPCadenceSpread;
     private static int AutoTDPLongFrames, AutoTDPSevereFrames;
     private static double AutoTDPDeficitStartApplied;             // level when the current deficit began (rangeMax only grows if we had to step up)
     private static bool AutoTDPDeficitWasPower, AutoTDPInPowerDeficit;   // power deficit (mean short / tail drift) vs a lone stutter
@@ -195,17 +234,30 @@ public static class PerformanceManager
     private static double AutoTDPProbeBackoffSec;
     private static int AutoTDPProbeFailures;
     private static double AutoTDPConvergeSec, AutoTDPMaxLimitedSec;
-    private static bool AutoTDPFloorRevalidated;                  // the learned floor's one revalidation probe has been spent this session
-    private static double AutoTDPLastStutterStepSec;              // last time a stutter bought a watt
+    private static double AutoTDPFloorRevalidateIntervalSec = AUTOTDP_FLOOR_REVALIDATE_SEC;
+    private static bool AutoTDPDownWasRevalidation;
     private static bool AutoTDPLongFrameActive;                   // the window currently holds a long frame (edge detection for strikes)
     private static double AutoTDPStrikeW;                         // level that showed a lone long frame right after being stepped down to ...
     private static int AutoTDPStrikeCount;                        // ... and on how many separate attempts; booked as failed at AUTOTDP_STRIKE_BOOK_COUNT
     private static bool AutoTDPBookedPending;                     // a failure was booked for the deficit in progress; undone if the deficit turns out to be a scene change
     private static double AutoTDPBookedDownFromW, AutoTDPBookedFloorPrev, AutoTDPBookedBackoffPrev;
+    private static double AutoTDPBookedRevalidateIntervalPrev;
     private static int AutoTDPBookedFailuresPrev;
     private static double AutoTDPLastHoldValidW;                  // last level that held for AUTOTDP_HOLD_VALIDATE_SEC without deficit (folded into the baseline at session end)
     private static bool AutoTDPConvergedAtLevel;
     private static double AutoTDPPendingW;
+
+    // AutoTDP - staged learning and lower content-cap detection
+    private static AutoTDPLearningPhase AutoTDPPhase;
+    private static AutoTDPLearningPhase AutoTDPPhaseBeforeContentCap;
+    private static double AutoTDPCoarseReadySec, AutoTDPCoarseFailSec, AutoTDPCoarseStableSec, AutoTDPCoarseAmbiguousSec;
+    private static double AutoTDPCoarseLastPassW;
+    private static bool AutoTDPFineHasProbed;
+    private static double AutoTDPPreviousMedianFps;
+    private static double AutoTDPSceneGraceUntilSec;
+    private static double AutoTDPContentCandidateSec, AutoTDPContentCandidateFps, AutoTDPContentPreW;
+    private static double AutoTDPContentCapFps, AutoTDPContentExitSec;
+    private static bool AutoTDPContentProbeActive;
 
     // AutoTDP - session and persistence
     private static string AutoTDPSessionId = string.Empty;
@@ -713,28 +765,27 @@ public static class PerformanceManager
      * ------------------
      * Sampling runs every INTERVAL_AUTO ms on autotdpWatchdog; hardware writes are rate-limited separately and go
      * through the single serialised writer (RequestTDPAsync). Telemetry is RTSS's per-frame frametime ring
-     * (AppEntry.StatFrameTimeBuf), copied into a local ring each tick, from which a 2 s window mean, p95 and
-     * long-frame count are derived. Frametime consistency is the primary control variable: a "deficit" fires on
-     * the tail before the mean framerate moves, which is what keeps a limiter-capped target (e.g. 30/30) stable.
+     * (AppEntry.StatFrameTimeBuf), copied into a local ring each tick, from which a 2 s window mean, percentiles and
+     * long-frame count are derived. A cold session first performs an FPS-only coarse search: 4 W steps find the
+     * target knee and 2/1 W recovery establishes the persisted baseline. The fine stage then enables frametime
+     * evidence and cautiously searches below that baseline for the floor. A stable lower content cadence pauses
+     * either stage and is confirmed with one +1 W causal probe so cutscenes do not drive a power climb.
      *
      * Control law (asymmetric, memory-based):
-     *   deficit  -> step up immediately, never gated by a down-settle: one watt for a lone long frame (a stutter),
-     *               one watt plus one per 5 % the hitch-immune mean is short for a power deficit. A power deficit
-     *               shortly after a down-step marks that descent as failed: the level above becomes the known
-     *               floor, the setpoint returns to the level the descent started from, and further probing below
-     *               the floor backs off exponentially; a failure whose deficit only clears well above that level
-     *               was a scene change and is undone. Under a limiter a lone long frame right after a descent is a
-     *               strike; the level fails when separate attempts strike it again.
+     *   deficit  -> a failed descent returns exactly to its pre-step level; otherwise a sustained power deficit earns
+     *               one watt at a time, measured on a fresh window at every level. Isolated hitches hold the current
+     *               level and never buy power. A failure whose deficit only clears well above the pre-step level was
+     *               a scene change and is undone. Under a limiter a lone long frame right after a descent is a strike;
+     *               the level fails when separate attempts strike it again.
      *   headroom -> after a dwell, step down: quickly while above the known floor, cautiously (probe) below it.
      *               Headroom is a sustained uncapped surplus, or - when the framerate is capped by a limiter/VSync -
      *               an immaculate frametime tail. Utilisation counters are not a headroom signal on either vendor.
      *   otherwise-> hold.
      *
-     * Learning/Tracking are persistence states, not control bounds: Tracking is Learning with a warm start from a
-     * baseline stored on the game's Profile (AutoTDPBaselines, one per game and power profile). Learning completes
-     * when the floor is established (probes below it failed AUTOTDP_PROBE_MAX_FAILURES times in a row); the baseline
-     * then sits in the lower part of the learned range and seeds later sessions. Upward correction is never limited
-     * by the stored range; a heavier scene simply grows the range.
+     * Learning/Tracking are persistence states, not control bounds: the coarse baseline is stored immediately and
+     * remains distinct from the frametime floor. Tracking begins when probes establish the floor, with the baseline
+     * then derived from the learned min/max range and used to seed later sessions. Upward correction is never limited
+     * by the stored range; longer gameplay and heavier scenes continuously grow and refine the profile.
      *
      * Threading: the tick owns the controller state under autotdpLock and never blocks on any other lock (profile
      * locks are TryEnter'd, writes are fire-and-forget). Profile/RTSS callbacks take autotdpLock blocking; they are
@@ -803,8 +854,9 @@ public static class PerformanceManager
                 AutoTDPRangeMaxW = max;
                 AutoTDPProbeFailures = AUTOTDP_PROBE_MAX_FAILURES;
                 AutoTDPProbeBackoffSec = 0;
-                AutoTDPFloorRevalidated = false;
+                AutoTDPFloorRevalidateIntervalSec = AUTOTDP_FLOOR_REVALIDATE_SEC;
                 AutoTDPWarm = true;
+                AutoTDPPhase = AutoTDPLearningPhase.Tracking;
                 if (AutoTDP < min)
                     AutoTDP = min;
 
@@ -886,6 +938,8 @@ public static class PerformanceManager
             AutoTDPRangeMinW = AutoTDPRangeMaxW = AutoTDPFloorW = AutoTDPLastHoldValidW = 0;
             AutoTDPProbeFailures = 0;
             AutoTDPProbeBackoffSec = 0;
+            AutoTDPFloorRevalidateIntervalSec = AUTOTDP_FLOOR_REVALIDATE_SEC;
+            AutoTDPPhase = AutoTDPLearningPhase.WaitingForTarget;
             AutoTDP = AutoTDPMax;
             AutoTDPApplied = 0; // forces an immediate write of the seed on the next tick
 
@@ -973,6 +1027,9 @@ public static class PerformanceManager
     {
         AutoTDPLoadBaseline(key);
         AutoTDPSeedFromBaseline();
+        AutoTDPPhase = autoTDPBaseline is null
+            ? AutoTDPLearningPhase.WaitingForTarget
+            : autoTDPBaseline.FloorLocked ? AutoTDPLearningPhase.Tracking : AutoTDPLearningPhase.FineFloor;
 
         // the same game coming straight back (alt-tab, overlay) continues where it left off instead of re-seeding,
         // including any efficiency step it had already committed
@@ -1008,6 +1065,9 @@ public static class PerformanceManager
 
         AutoTDPResetDwell();
         AutoTDPLoadBaseline(key);
+        AutoTDPPhase = autoTDPBaseline is null
+            ? AutoTDPLearningPhase.WaitingForTarget
+            : autoTDPBaseline.FloorLocked ? AutoTDPLearningPhase.Tracking : AutoTDPLearningPhase.FineFloor;
 
         // the current level is the only known point for the new target unless a baseline exists
         if (autoTDPBaseline is null)
@@ -1075,6 +1135,7 @@ public static class PerformanceManager
         autoTDPBaseline = null;
         AutoTDPBaselineDirty = false;
         AutoTDPWarm = false;
+        AutoTDPPhase = AutoTDPLearningPhase.None;
         AutoTDPApplied = 0;
 
         AutoTDPResetTelemetry();
@@ -1117,6 +1178,9 @@ public static class PerformanceManager
             // fresh telemetry for the (re)hooked process; resume from the current setpoint, re-applied on the next tick
             AutoTDPResetTelemetry();
             AutoTDPResetDwell();
+            AutoTDPPhase = autoTDPBaseline is null
+                ? AutoTDPLearningPhase.WaitingForTarget
+                : autoTDPBaseline.FloorLocked ? AutoTDPLearningPhase.Tracking : AutoTDPLearningPhase.FineFloor;
             AutoTDPApplied = 0;
             AutoTDPLastWriteSec = 0;
 
@@ -1195,11 +1259,11 @@ public static class PerformanceManager
             }
 
             AutoTDPDetectCap(now, dt);
-            reason = AutoTDPStep(now, dt);
+            reason = AutoTDPControlStep(now, dt);
             AutoTDPActuate(now, reason);
             AutoTDPMaintainMSR();
             AutoTDPUpdateState(now, dt, reason);
-            AutoTDPEfficiencyStep(now, dt, AutoTDPInDeficit);
+            AutoTDPEfficiencyStep(now, dt, AutoTDPInDeficit || AutoTDPPhase != AutoTDPLearningPhase.Tracking);
             AutoTDPTrace(now, reason);
         }
         catch (Exception ex)
@@ -1312,6 +1376,7 @@ public static class PerformanceManager
             return;
 
         AutoTDPWinFps = n / (sum / 1000.0);
+        AutoTDPWindowSec = sum / 1000.0;
         AutoTDPLongFrames = longFrames;
         AutoTDPSevereFrames = severeFrames;
 
@@ -1321,8 +1386,15 @@ public static class PerformanceManager
         AutoTDPTrimFps = trimmed > 0 && sum - severeSum > 0 ? trimmed / ((sum - severeSum) / 1000.0) : AutoTDPWinFps;
 
         Array.Sort(AutoTDPWindowScratch, 0, n);
+        int p05Index = Math.Clamp((int)Math.Floor(0.05 * (n - 1)), 0, n - 1);
+        int medianIndex = Math.Clamp((int)Math.Floor(0.50 * (n - 1)), 0, n - 1);
         int p95Index = Math.Clamp((int)Math.Ceiling(0.95 * n) - 1, 0, n - 1);
-        AutoTDPP95Ratio = AutoTDPWindowScratch[p95Index] / ftTarget;
+        AutoTDPP05Ms = AutoTDPWindowScratch[p05Index];
+        AutoTDPMedianMs = AutoTDPWindowScratch[medianIndex];
+        AutoTDPP95Ms = AutoTDPWindowScratch[p95Index];
+        AutoTDPP95Ratio = AutoTDPP95Ms / ftTarget;
+        AutoTDPMedianFps = AutoTDPMedianMs > 0 ? 1000.0 / AutoTDPMedianMs : 0;
+        AutoTDPCadenceSpread = AutoTDPMedianMs > 0 ? (AutoTDPP95Ms - AutoTDPP05Ms) / AutoTDPMedianMs : 0;
 
         double alpha = 1.0 - Math.Exp(-dt / AUTOTDP_SLOW_TAU_SEC);
         AutoTDPSlowFps = AutoTDPSlowFps <= 0 ? AutoTDPWinFps : AutoTDPSlowFps + alpha * (AutoTDPWinFps - AutoTDPSlowFps);
@@ -1357,18 +1429,314 @@ public static class PerformanceManager
         AutoTDPCapped = AutoTDPCappedByLimiter || now < AutoTDPCapStickyUntilSec;
     }
 
-    /// <summary>Applies the control law to the setpoint for this tick and returns the decision taken (for the trace/status).</summary>
-    private static string AutoTDPStep(double now, double dt)
+    private static string AutoTDPControlStep(double now, double dt)
+    {
+        string? contentCapReason = AutoTDPContentCapStep(now, dt);
+        if (contentCapReason is not null)
+            return contentCapReason;
+
+        return AutoTDPPhase switch
+        {
+            AutoTDPLearningPhase.WaitingForTarget or AutoTDPLearningPhase.CoarseDown or AutoTDPLearningPhase.CoarseRecover => AutoTDPCoarseStep(now, dt),
+            _ => AutoTDPFineStep(now, dt),
+        };
+    }
+
+    /// <summary>
+    ///     Detects a clean lower presentation cadence (for example a 30 FPS cutscene under a 60 FPS target).
+    ///     Normal control is frozen while the candidate is measured. Away from the ceiling one +1 W probe decides
+    ///     whether the cadence is content-owned or actually responds to power.
+    /// </summary>
+    private static string? AutoTDPContentCapStep(double now, double dt)
+    {
+        double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
+        bool fullWindow = AutoTDPWindowSec >= AUTOTDP_COARSE_WINDOW_SEC && AutoTDPMedianFps > 0;
+        bool stableLowerCadence = fullWindow && AutoTDPLearningPolicy.IsStableLowerCadence(
+            AutoTDPMedianFps, AutoTDPTargetFPS, AutoTDPCadenceSpread, AUTOTDP_CONTENT_CAP_BELOW_REL, AUTOTDP_CONTENT_CAP_SPREAD);
+        bool cleanCadence = fullWindow && AutoTDPCadenceSpread <= AUTOTDP_CONTENT_CAP_SPREAD;
+        double previousMedian = AutoTDPPreviousMedianFps;
+        if (AutoTDPMedianFps > 0)
+            AutoTDPPreviousMedianFps = AutoTDPMedianFps;
+
+        if (AutoTDPPhase == AutoTDPLearningPhase.ContentCapped)
+        {
+            if (!fullWindow)
+            {
+                AutoTDPInDeficit = AutoTDPInPowerDeficit = false;
+                return "content-cap-measure";
+            }
+
+            bool sameCadence = cleanCadence && AutoTDPContentCapFps > 0
+                && Math.Abs(AutoTDPMedianFps - AutoTDPContentCapFps) / AutoTDPContentCapFps <= AUTOTDP_CONTENT_CAP_EXIT_REL;
+            AutoTDPContentExitSec = sameCadence ? 0 : AutoTDPContentExitSec + dt;
+            AutoTDPInDeficit = AutoTDPInPowerDeficit = false;
+
+            if (AutoTDPContentExitSec < AUTOTDP_CONTENT_CAP_EXIT_SEC)
+                return "content-cap-hold";
+
+            AutoTDPPhase = AutoTDPPhaseBeforeContentCap is AutoTDPLearningPhase.None or AutoTDPLearningPhase.ContentCapped
+                ? (AutoTDPWarm ? AutoTDPLearningPhase.Tracking : autoTDPBaseline is null ? AutoTDPLearningPhase.WaitingForTarget : AutoTDPLearningPhase.FineFloor)
+                : AutoTDPPhaseBeforeContentCap;
+            AutoTDPContentCapFps = AutoTDPContentExitSec = AutoTDPContentCandidateSec = 0;
+            AutoTDPClearLocalFrameWindow();
+            LogManager.LogInformation("AutoTDP: lower content cap ended, resuming {0}", AutoTDPPhase);
+            return "content-cap-exit";
+        }
+
+        if (AutoTDPContentProbeActive)
+        {
+            AutoTDPInDeficit = AutoTDPInPowerDeficit = false;
+            if (pendingTdpWrite is { IsCompleted: false } || AutoTDPWindowSec < AUTOTDP_CONTENT_CAP_PROBE_SEC - 0.1)
+                return "content-cap-probe-wait";
+
+            double response = AutoTDPMedianFps - AutoTDPContentCandidateFps;
+            AutoTDPContentProbeActive = false;
+            if (AutoTDPLearningPolicy.HasPowerResponse(AutoTDPContentCandidateFps, AutoTDPMedianFps,
+                AUTOTDP_CONTENT_CAP_RESPONSE_FPS, AUTOTDP_CONTENT_CAP_RESPONSE_REL))
+            {
+                AutoTDPPhase = AutoTDPPhaseBeforeContentCap;
+                AutoTDPContentCandidateSec = AutoTDPContentCandidateFps = AutoTDPContentPreW = 0;
+                LogManager.LogInformation("AutoTDP: lower cadence responded by {0:F1} FPS to +1 W, treating it as a power deficit", response);
+                return "content-cap-rejected";
+            }
+
+            AutoTDPContentCapFps = AutoTDPContentCandidateFps;
+            AutoTDPPhase = AutoTDPLearningPhase.ContentCapped;
+            AutoTDP = AutoTDPContentPreW;
+            AutoTDPContentExitSec = 0;
+            LogManager.LogInformation("AutoTDP: content capped near {0:F0} FPS, holding {1} W", AutoTDPContentCapFps, AutoTDPContentPreW);
+            return "content-cap-confirmed";
+        }
+
+        bool abruptDrop = previousMedian > 0 && AutoTDPMedianFps > 0
+            && AutoTDPMedianFps < previousMedian * (1.0 - AUTOTDP_SCENE_DROP_REL)
+            && (AutoTDPLastWriteSec <= 0 || now - AutoTDPLastWriteSec > AUTOTDP_WINDOW_SEC);
+        if (abruptDrop)
+            AutoTDPSceneGraceUntilSec = now + AUTOTDP_WINDOW_SEC;
+
+        if (stableLowerCadence)
+        {
+            if (AutoTDPContentCandidateSec <= 0
+                || AutoTDPContentCandidateFps <= 0
+                || Math.Abs(AutoTDPMedianFps - AutoTDPContentCandidateFps) / AutoTDPContentCandidateFps > AUTOTDP_CONTENT_CAP_STABLE_REL)
+            {
+                AutoTDPContentCandidateSec = Math.Min(AutoTDPWindowSec, AUTOTDP_CONTENT_CAP_DETECT_SEC);
+                AutoTDPContentCandidateFps = AutoTDPMedianFps;
+                AutoTDPContentPreW = applied;
+                AutoTDPPhaseBeforeContentCap = AutoTDPPhase;
+            }
+            else
+            {
+                AutoTDPContentCandidateSec += dt;
+                AutoTDPContentCandidateFps += 0.25 * (AutoTDPMedianFps - AutoTDPContentCandidateFps);
+            }
+
+            AutoTDPInDeficit = AutoTDPInPowerDeficit = false;
+            if (AutoTDPContentCandidateSec < AUTOTDP_CONTENT_CAP_DETECT_SEC)
+                return "content-cap-candidate";
+
+            if (applied >= AutoTDPMax - 0.5)
+            {
+                AutoTDPContentCapFps = AutoTDPContentCandidateFps;
+                AutoTDPPhase = AutoTDPLearningPhase.ContentCapped;
+                AutoTDPContentExitSec = 0;
+                LogManager.LogInformation("AutoTDP: content capped near {0:F0} FPS at the session ceiling", AutoTDPContentCapFps);
+                return "content-cap-confirmed";
+            }
+
+            AutoTDPContentProbeActive = true;
+            AutoTDP = Math.Min(AutoTDPMax, applied + 1);
+            return "content-cap-probe";
+        }
+
+        if (now < AutoTDPSceneGraceUntilSec)
+        {
+            AutoTDPInDeficit = AutoTDPInPowerDeficit = false;
+            return "scene-grace";
+        }
+
+        AutoTDPContentCandidateSec = AutoTDPContentCandidateFps = AutoTDPContentPreW = 0;
+        return null;
+    }
+
+    /// <summary>FPS-only cold search: bracket the knee with 4 W down-steps and recover in 2/1 W steps.</summary>
+    private static string AutoTDPCoarseStep(double now, double dt)
+    {
+        double target = AutoTDPTargetFPS;
+        double passBand = Math.Max(AUTOTDP_LOW_BAND_FPS, 0.01 * target);
+        double failBand = Math.Max(AUTOTDP_COARSE_FAIL_FPS, AUTOTDP_COARSE_FAIL_REL * target);
+        double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
+        bool fullWindow = AutoTDPWindowSec >= AUTOTDP_COARSE_WINDOW_SEC;
+        // A storage hitch may be removed from TrimFps, but it must not turn a visibly short raw-FPS window into a
+        // passing coarse level. Such a window is uncertain: hold this wattage until either a clean pass or a real
+        // sustained failure appears.
+        bool passes = fullWindow && AutoTDPLearningPolicy.IsCoarsePass(
+            AutoTDPWinFps, AutoTDPTrimFps, target, passBand, failBand);
+        bool fails = fullWindow && AutoTDPLearningPolicy.IsCoarseFailure(AutoTDPTrimFps, target, failBand);
+
+        AutoTDPInDeficit = AutoTDPInPowerDeficit = false;
+
+        if (AutoTDPPhase == AutoTDPLearningPhase.WaitingForTarget)
+        {
+            AutoTDPCoarseReadySec = passes ? Math.Max(AutoTDPCoarseReadySec + dt, AutoTDPWindowSec) : 0;
+            if (AutoTDPCoarseReadySec < AUTOTDP_COARSE_READY_SEC)
+            {
+                if (fullWindow && pendingTdpWrite is not { IsCompleted: false })
+                {
+                    if (fails)
+                    {
+                        AutoTDPCoarseAmbiguousSec = 0;
+                        if (applied < AutoTDPMax - 0.5)
+                        {
+                            double shortRel = Math.Max(0, (target - AutoTDPTrimFps) / target);
+                            int targetStep = Math.Clamp(AUTOTDP_UP_STEP_W + (int)Math.Floor(shortRel / AUTOTDP_UP_GAIN_REL),
+                                AUTOTDP_UP_STEP_W, AUTOTDP_UP_STEP_MAX_W);
+                            AutoTDP = Math.Min(AutoTDPMax, applied + targetStep);
+                            return targetStep > 1 ? "up-coarse-target+" + targetStep : "up-coarse-target";
+                        }
+
+                        AutoTDPInDeficit = AutoTDPInPowerDeficit = true;
+                    }
+                    else
+                    {
+                        AutoTDPCoarseAmbiguousSec = Math.Max(AutoTDPCoarseAmbiguousSec + dt, AutoTDPWindowSec);
+                        if (AutoTDPCoarseAmbiguousSec >= AUTOTDP_COARSE_AMBIGUOUS_SEC)
+                        {
+                            AutoTDPCoarseAmbiguousSec = 0;
+                            if (applied < AutoTDPMax - 0.5)
+                            {
+                                AutoTDP = Math.Min(AutoTDPMax, applied + AUTOTDP_UP_STEP_W);
+                                return "up-coarse-target";
+                            }
+
+                            AutoTDPInDeficit = AutoTDPInPowerDeficit = true;
+                        }
+                    }
+                }
+                return "coarse-wait-target";
+            }
+
+            AutoTDPPhase = AutoTDPLearningPhase.CoarseDown;
+            AutoTDPCoarseLastPassW = applied;
+            AutoTDPCoarseReadySec = AutoTDPCoarseAmbiguousSec = 0;
+            LogManager.LogInformation("AutoTDP: coarse FPS search started at {0} W", applied);
+        }
+
+        if (!fullWindow || pendingTdpWrite is { IsCompleted: false })
+            return "coarse-measure";
+
+        if (AutoTDPPhase == AutoTDPLearningPhase.CoarseDown)
+        {
+            if (passes)
+            {
+                AutoTDPCoarseLastPassW = applied;
+                AutoTDPCoarseFailSec = AutoTDPCoarseAmbiguousSec = 0;
+                if (applied <= TDPMin + 0.5)
+                    return AutoTDPCompleteCoarseBaseline(applied);
+
+                AutoTDP = Math.Max(TDPMin, applied - AUTOTDP_COARSE_DOWN_STEP_W);
+                return "coarse-down";
+            }
+
+            if (fails)
+                AutoTDPCoarseFailSec += dt;
+            else
+                AutoTDPCoarseAmbiguousSec += dt;
+
+            if (AutoTDPCoarseFailSec < 1.0 && AutoTDPCoarseAmbiguousSec < AUTOTDP_COARSE_AMBIGUOUS_SEC)
+                return "coarse-measure";
+
+            AutoTDPPhase = AutoTDPLearningPhase.CoarseRecover;
+            AutoTDPCoarseStableSec = AutoTDPCoarseFailSec = AutoTDPCoarseAmbiguousSec = 0;
+            int recover = AutoTDPLearningPolicy.CoarseRecoveryStep(AutoTDPCoarseLastPassW, applied,
+                AUTOTDP_COARSE_RECOVER_STEP_W, AUTOTDP_UP_STEP_W);
+            AutoTDP = Math.Min(AutoTDPMax, applied + recover);
+            return recover > 1 ? "coarse-recover+2" : "coarse-recover";
+        }
+
+        if (passes)
+        {
+            AutoTDPCoarseStableSec = Math.Max(AutoTDPCoarseStableSec + dt, AutoTDPWindowSec);
+            if (AutoTDPCoarseStableSec >= AUTOTDP_COARSE_STABLE_SEC)
+                return AutoTDPCompleteCoarseBaseline(applied);
+            return "coarse-stabilize";
+        }
+
+        AutoTDPCoarseStableSec = 0;
+        if (fails)
+            AutoTDPCoarseFailSec += dt;
+        else
+            AutoTDPCoarseAmbiguousSec = Math.Max(AutoTDPCoarseAmbiguousSec + dt, AutoTDPWindowSec);
+
+        if (AutoTDPCoarseFailSec < 1.0 && AutoTDPCoarseAmbiguousSec < AUTOTDP_COARSE_AMBIGUOUS_SEC)
+            return "coarse-measure";
+
+        int step = AutoTDPLearningPolicy.CoarseRecoveryStep(AutoTDPCoarseLastPassW, applied,
+            AUTOTDP_COARSE_RECOVER_STEP_W, AUTOTDP_UP_STEP_W);
+        AutoTDP = Math.Min(AutoTDPMax, applied + step);
+        AutoTDPCoarseFailSec = AutoTDPCoarseAmbiguousSec = 0;
+        return step > 1 ? "coarse-recover+2" : "coarse-recover";
+    }
+
+    private static string AutoTDPCompleteCoarseBaseline(double level)
+    {
+        level = Math.Clamp(Math.Round(level), TDPMin, AutoTDPMax);
+        AutoTDPFloorW = AutoTDPRangeMinW = level;
+        AutoTDPRangeMaxW = Math.Max(level, AutoTDPRangeMaxW);
+        AutoTDPProbeFailures = 0;
+        AutoTDPProbeBackoffSec = 0;
+        AutoTDPFineHasProbed = false;
+        AutoTDPPhase = AutoTDPLearningPhase.FineFloor;
+        AutoTDPLastHoldValidW = level;
+
+        autoTDPBaseline = new AutoTDPBaseline
+        {
+            TargetFps = (float)AutoTDPTargetFPS,
+            TypicalWatts = level,
+            RecentWatts = level,
+            MinWatts = level,
+            MaxWatts = level,
+            FloorLocked = false,
+            Samples = 1,
+            LastUpdatedUtc = DateTime.UtcNow,
+            TemperatureAtConvergence = PlatformManager.LibreHardware?.GetCPUTemperature() ?? 0,
+        };
+        AutoTDPBaselineDirty = true;
+        AutoTDPSaveBaseline(true);
+        AutoTDPResetFineDwell();
+        LogManager.LogInformation("AutoTDP: coarse FPS baseline established at {0} W; starting frametime floor search", level);
+        return "coarse-baseline";
+    }
+
+    private static void AutoTDPResetFineDwell()
+    {
+        AutoTDPHeadroomSec = AutoTDPDeficitSec = AutoTDPHoldSec = 0;
+        AutoTDPUpSettleUntilSec = AutoTDPDownSettleUntilSec = 0;
+        AutoTDPLastDownSec = 0;
+        AutoTDPInDeficit = AutoTDPInPowerDeficit = false;
+        AutoTDPConvergeSec = 0;
+        AutoTDPConvergedAtLevel = false;
+    }
+
+    /// <summary>Applies the frametime-aware fine/tracking control law.</summary>
+    private static string AutoTDPFineStep(double now, double dt)
     {
         double target = AutoTDPTargetFPS;
         double lowBand = Math.Max(AUTOTDP_LOW_BAND_FPS, 0.01 * target);
         double highBand = Math.Max(AUTOTDP_HIGH_BAND_FPS, 0.03 * target);
 
+        // Every fine decision must be causal evidence from one applied wattage. AutoTDPCollectWrite clears the local
+        // ring after a successful hardware change; do not judge the partial replacement window.
+        if (AutoTDPWindowSec < AUTOTDP_COARSE_WINDOW_SEC)
+        {
+            AutoTDPInPowerDeficit = false;
+            return "fine-measure";
+        }
+
         // Two kinds of deficit. A *power* deficit is evidence the level cannot hold the target: the window mean is
         // short, or (near the target) the tail drifts. A *stutter* is one long frame in an otherwise fine window -
-        // asset streaming, a hitch - it earns an immediate +1 W (cheap, reclaimed later) but says nothing about the
-        // level, so it never moves the range or the MaxLimited state, and moves the floor only when the same level
-        // is struck on separate attempts (strikes, below).
+        // asset streaming, a hitch - and now only pauses descent. It never buys power, moves the range, resets
+        // convergence, or affects MaxLimited; repeated strikes after separate descents can still establish a floor.
         //   Capped (limiter/VSync at the target): frametimes are flat, so any long frame is a stutter and p95 drift is
         //   a power deficit. Uncapped: frametimes jitter by design; the tail only counts while the mean sits near the
         //   target, and lone long frames at a mean far above the target are ignored entirely.
@@ -1380,7 +1748,7 @@ public static class PerformanceManager
         bool stutter = AutoTDPCapped
             ? AutoTDPLongFrames >= AUTOTDP_LONGFRAME_COUNT
             : AutoTDPSlowFps < target * AUTOTDP_UNCAPPED_NEAR_RATIO && AutoTDPSevereFrames >= 1;
-        bool deficit = powerDeficit || stutter;
+        bool intervention = powerDeficit || stutter;
         bool tailClean = AutoTDPLongFrames == 0 && AutoTDPP95Ratio <= AUTOTDP_TAIL_CLEAN_RATIO;
         // Intel GPU "load" reads ~100 % whenever the GPU is busy regardless of power (verified on device); it is not a headroom signal
         bool headroom = AutoTDPSlowFps > target + highBand || (AutoTDPCapped && tailClean);
@@ -1394,7 +1762,7 @@ public static class PerformanceManager
 
         AutoTDPInPowerDeficit = powerDeficit;
 
-        if (deficit)
+        if (intervention)
         {
             if (!AutoTDPInDeficit)
             {
@@ -1434,44 +1802,45 @@ public static class PerformanceManager
                 AutoTDPBookedPending = true;
                 AutoTDPBookedDownFromW = AutoTDPDownFromW;
                 AutoTDPBookedFloorPrev = AutoTDPFloorW;
-                AutoTDPBookedFailuresPrev = AutoTDPProbeFailures;
+                AutoTDPBookedFailuresPrev = AutoTDPDownWasRevalidation ? AUTOTDP_PROBE_MAX_FAILURES : AutoTDPProbeFailures;
                 AutoTDPBookedBackoffPrev = AutoTDPProbeBackoffSec;
+                AutoTDPBookedRevalidateIntervalPrev = AutoTDPFloorRevalidateIntervalSec;
 
                 AutoTDPFloorW = applied + 1;
                 AutoTDPProbeFailures++;
                 AutoTDPProbeBackoffSec = Math.Min(AUTOTDP_PROBE_BACKOFF_MAX_SEC, AUTOTDP_PROBE_DWELL_SEC * Math.Pow(2, AutoTDPProbeFailures));
+                if (AutoTDPDownWasRevalidation)
+                    AutoTDPFloorRevalidateIntervalSec = AutoTDPLearningPolicy.NextRevalidationInterval(
+                        AutoTDPFloorRevalidateIntervalSec, AUTOTDP_FLOOR_REVALIDATE_SEC, AUTOTDP_FLOOR_REVALIDATE_MAX_SEC);
+                AutoTDPDownWasRevalidation = false;
                 AutoTDPLastDownSec = 0;
                 AutoTDPStrikeW = AutoTDPStrikeCount = 0;
-                AutoTDP = Math.Max(AutoTDP, Math.Max(AutoTDPDownFromW, applied + 1));
+                // Return to the known pre-descent level first. A still-heavier scene must prove that it needs each
+                // additional watt on its own fresh measurement window.
+                AutoTDP = Math.Max(AutoTDP, AutoTDPLearningPolicy.FineRecoveryTarget(
+                    applied, AutoTDPDownFromW, true, AutoTDPDeficitSec, AUTOTDP_DEFICIT_DWELL_SEC));
+                AutoTDPDeficitSec = 0;
                 AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
                 reason = "down-fail";
                 LogManager.LogInformation("AutoTDP: {0} W does not hold {1} FPS ({2}), floor {3} W, next probe after {4:F0} s", applied, target, strikeBooked ? "repeated long frames" : "power deficit", AutoTDPFloorW, AutoTDPProbeBackoffSec);
             }
             else if (now >= AutoTDPUpSettleUntilSec)
             {
-                // recovery is proportional to the error: one watt for a tail-only deficit, one more per 5 % the
-                // (hitch-immune) mean is short of the target, capped. Each step is re-evaluated after the settle, so
-                // the steps shrink as the gap closes; a fixed jump toward a remembered level was tried and overshoots.
                 if (powerDeficit)
                 {
-                    double shortRel = Math.Max(0, (target - AutoTDPTrimFps) / target);
-                    int step = Math.Clamp(AUTOTDP_UP_STEP_W + (int)Math.Floor(shortRel / AUTOTDP_UP_GAIN_REL), AUTOTDP_UP_STEP_W, AUTOTDP_UP_STEP_MAX_W);
-                    AutoTDP = applied + step;
-                    reason = step > 1 ? "up+" + step : "up";
-                }
-                else if (now - AutoTDPLastStutterStepSec >= AUTOTDP_STUTTER_SPACING_SEC)
-                {
-                    // a long frame stays in the window for several ticks and loading screens produce them continuously:
-                    // one stutter buys one watt, once per spacing, never a climb
-                    AutoTDP = applied + AUTOTDP_UP_STEP_W;
-                    AutoTDPLastStutterStepSec = now;
-                    reason = "stutter";
+                    if (AutoTDPDeficitSec < AUTOTDP_DEFICIT_DWELL_SEC)
+                        reason = "deficit-dwell";
+                    else
+                    {
+                        AutoTDP = AutoTDPLearningPolicy.FineRecoveryTarget(
+                            applied, 0, false, AutoTDPDeficitSec, AUTOTDP_DEFICIT_DWELL_SEC);
+                        AutoTDPDeficitSec = 0;
+                        AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
+                        reason = "up";
+                    }
                 }
                 else
                     reason = "stutter-hold";
-
-                if (reason != "stutter-hold")
-                    AutoTDPUpSettleUntilSec = now + AUTOTDP_UP_SETTLE_SEC;
             }
             else
                 reason = "up-settle";
@@ -1500,13 +1869,13 @@ public static class PerformanceManager
             if (AutoTDPStrikeCount > 0 && applied - 1 <= AutoTDPStrikeW)
                 dwell = Math.Max(dwell, AUTOTDP_STRIKE_DWELL_SEC);
 
-            // a locked floor gets one revalidation probe per session once the game has been quiet for a long time,
-            // so a patch or a cooler device can still lower the learned limit; a failure locks it again for good
-            if (floorLocked && !AutoTDPFloorRevalidated && AutoTDPHeadroomSec >= AUTOTDP_FLOOR_REVALIDATE_SEC)
+            // A learned floor remains the normal hard limit, but long clean gameplay earns another cautious probe.
+            // Failed revalidations double this interval up to 30 minutes; a successful one resets it.
+            if (floorLocked && AutoTDPHeadroomSec >= AutoTDPFloorRevalidateIntervalSec)
             {
-                AutoTDPFloorRevalidated = true;
                 AutoTDPProbeFailures = AUTOTDP_PROBE_MAX_FAILURES - 1;
                 floorLocked = false;
+                AutoTDPDownWasRevalidation = true;
                 LogManager.LogInformation("AutoTDP: revalidating the learned floor of {0} W", AutoTDPFloorW);
             }
 
@@ -1516,6 +1885,7 @@ public static class PerformanceManager
                 AutoTDPDownFromW = applied;
                 AutoTDPDownToW = applied - step;
                 AutoTDPDownWasProbe = cautious;
+                AutoTDPFineHasProbed |= cautious;
                 AutoTDPLastDownSec = now;
                 AutoTDP = applied - step;
                 AutoTDPDownSettleUntilSec = now + settle;
@@ -1542,12 +1912,32 @@ public static class PerformanceManager
             reason = "hold";
         }
 
-        if (!deficit && AutoTDPInDeficit)
+        if (!powerDeficit && AutoTDPInDeficit)
         {
             // remember the level at which a deficit cleared, but only when we actually had to step up to clear it
             // (a loading screen or menu hitch at the current level says nothing about the game's heavy scenes)
             if (AutoTDPDeficitWasPower && applied > AutoTDPDeficitStartApplied)
                 AutoTDPRangeMaxW = Math.Max(AutoTDPRangeMaxW, applied);
+
+            // Before the first fine probe, a sustained deficit at the coarse baseline means the FPS-only result
+            // did not carry enough frametime margin. Raise both the candidate floor and baseline to the first level
+            // that recovered; later scene deficits grow MaxWatts instead of redefining the floor.
+            if (AutoTDPPhase == AutoTDPLearningPhase.FineFloor && !AutoTDPFineHasProbed
+                && AutoTDPDeficitWasPower && AutoTDPFloorW > 0
+                && AutoTDPDeficitStartApplied <= AutoTDPFloorW + 0.5 && applied > AutoTDPFloorW)
+            {
+                AutoTDPFloorW = AutoTDPRangeMinW = applied;
+                if (autoTDPBaseline is not null)
+                {
+                    autoTDPBaseline.MinWatts = applied;
+                    autoTDPBaseline.RecentWatts = Math.Max(autoTDPBaseline.RecentWatts, applied);
+                    autoTDPBaseline.MaxWatts = Math.Max(autoTDPBaseline.MaxWatts, applied);
+                    autoTDPBaseline.LastUpdatedUtc = DateTime.UtcNow;
+                    AutoTDPBaselineDirty = true;
+                    AutoTDPSaveBaseline(true);
+                }
+                LogManager.LogInformation("AutoTDP: frametime recovery raised the open floor and baseline to {0} W", applied);
+            }
 
             // a failure booked against a level is only valid if the level above it was enough again: a deficit that
             // needed several watts more than we stepped down from was a heavier scene (menu to game, a cutscene, a
@@ -1560,11 +1950,14 @@ public static class PerformanceManager
                     AutoTDPFloorW = AutoTDPBookedFloorPrev;
                     AutoTDPProbeFailures = AutoTDPBookedFailuresPrev;
                     AutoTDPProbeBackoffSec = AutoTDPBookedBackoffPrev;
+                    AutoTDPFloorRevalidateIntervalSec = AutoTDPBookedRevalidateIntervalPrev;
                 }
                 AutoTDPBookedPending = false;
             }
         }
-        AutoTDPInDeficit = deficit;
+        // Isolated hitches affect the local decision above, but are not a learned power deficit and therefore do not
+        // reset convergence or block background profile progress.
+        AutoTDPInDeficit = powerDeficit;
 
         AutoTDP = Math.Clamp(AutoTDP, TDPMin, Math.Max(TDPMin, AutoTDPMax));
         return reason;
@@ -1572,8 +1965,8 @@ public static class PerformanceManager
 
     /// <summary>
     ///     The fail window after a down-step has passed without a booked failure. The step only counts as a success
-    ///     if we are still at (or below) the level it went to; a stutter that bought a watt inside the window leaves
-    ///     the step inconclusive - neither a failure nor a reset of the probe failure count.
+    ///     if we are still at (or below) the level it went to; any unrelated recovery inside the window leaves the
+    ///     step inconclusive - neither a failure nor a reset of the probe failure count.
     /// </summary>
     private static void AutoTDPDescentWindowPassed(double applied)
     {
@@ -1596,10 +1989,16 @@ public static class PerformanceManager
         if (AutoTDPDownWasProbe)
         {
             AutoTDPFloorW = applied;
-            AutoTDPProbeFailures = 0;
+            AutoTDPProbeFailures = AutoTDPDownWasRevalidation ? AUTOTDP_PROBE_MAX_FAILURES : 0;
             AutoTDPProbeBackoffSec = 0;
+            if (AutoTDPDownWasRevalidation)
+            {
+                AutoTDPFloorRevalidateIntervalSec = AUTOTDP_FLOOR_REVALIDATE_SEC;
+                AutoTDPHeadroomSec = 0;
+            }
             LogManager.LogInformation("AutoTDP: probe succeeded, {0} W holds {1} FPS", applied, AutoTDPTargetFPS);
         }
+        AutoTDPDownWasRevalidation = false;
     }
 
     /// <summary>
@@ -1655,8 +2054,23 @@ public static class PerformanceManager
             AutoTDPHoldSec = 0;
             AutoTDPConvergeSec = 0;
             AutoTDPConvergedAtLevel = false;
+
+            // Every decision after a hardware change must see frames rendered wholly at the new level. Keep the RTSS
+            // counter so the next tick imports only frames produced after this successful write.
+            AutoTDPClearLocalFrameWindow();
         }
         AutoTDPPendingW = 0;
+    }
+
+    private static void AutoTDPClearLocalFrameWindow()
+    {
+        AutoTDPFrameHead = AutoTDPFrameCount = 0;
+        AutoTDPWinFps = AutoTDPTrimFps = AutoTDPSlowFps = 0;
+        AutoTDPWindowSec = AutoTDPP05Ms = AutoTDPMedianMs = AutoTDPP95Ms = AutoTDPMedianFps = AutoTDPCadenceSpread = 0;
+        AutoTDPP95Ratio = 0;
+        AutoTDPLongFrames = AutoTDPSevereFrames = 0;
+        AutoTDPLongFrameActive = false;
+        AutoTDPCoarseReadySec = AutoTDPCoarseFailSec = AutoTDPCoarseStableSec = AutoTDPCoarseAmbiguousSec = 0;
     }
 
     /// <summary>Keeps MSR 0x610 in step with the requested rails on Intel; skipped entirely on backends without MSR support.</summary>
@@ -1678,15 +2092,19 @@ public static class PerformanceManager
     {
         bool deficit = AutoTDPInDeficit;
         double applied = AutoTDPApplied > 0 ? AutoTDPApplied : AutoTDP;
+        bool fineControl = AutoTDPPhase is AutoTDPLearningPhase.FineFloor or AutoTDPLearningPhase.Tracking;
+        bool learningPaused = AutoTDPPhase == AutoTDPLearningPhase.ContentCapped || AutoTDPContentCandidateSec > 0 || AutoTDPContentProbeActive;
 
         // pinned at the ceiling and still short: nothing more the controller can do
-        if (AutoTDPInPowerDeficit && applied >= AutoTDPMax - 0.5)
+        if (!learningPaused && AutoTDPInPowerDeficit && applied >= AutoTDPMax - 0.5)
             AutoTDPMaxLimitedSec += dt;
         else
             AutoTDPMaxLimitedSec = 0;
 
         // convergence: one applied level, no deficit, for AUTOTDP_CONVERGE_SEC
-        if (deficit)
+        if (!fineControl || learningPaused)
+            AutoTDPConvergeSec = 0;
+        else if (deficit)
             AutoTDPConvergeSec = 0;
         else if (AutoTDPApplied > 0)
             AutoTDPConvergeSec += dt;
@@ -1732,7 +2150,10 @@ public static class PerformanceManager
 
         bool promoted = !AutoTDPWarm && established;
         if (promoted)
+        {
             AutoTDPWarm = true;
+            AutoTDPPhase = AutoTDPLearningPhase.Tracking;
+        }
 
         LogManager.LogInformation("AutoTDP converged at {0} W for {1} FPS (range {2}-{3} W, floor {4}){5}", level, AutoTDPTargetFPS, autoTDPBaseline!.MinWatts, autoTDPBaseline.MaxWatts, established ? "locked" : "open", promoted ? ", tracking" : string.Empty);
         AutoTDPSaveBaseline(first || promoted);
@@ -1750,11 +2171,14 @@ public static class PerformanceManager
 
         double sessionMax = Math.Max(AutoTDPRangeMaxW, level);
         autoTDPBaseline.TargetFps = (float)AutoTDPTargetFPS;
-        autoTDPBaseline.RecentWatts = level;
+        if (autoTDPBaseline.Samples == 0)
+            autoTDPBaseline.RecentWatts = level;
+        else if (!autoTDPBaseline.FloorLocked && !floorLocked && AutoTDPFloorW > autoTDPBaseline.RecentWatts)
+            autoTDPBaseline.RecentWatts = AutoTDPFloorW;
         autoTDPBaseline.TypicalWatts = autoTDPBaseline.Samples == 0
             ? level
             : autoTDPBaseline.TypicalWatts + AUTOTDP_BASELINE_EWMA * (level - autoTDPBaseline.TypicalWatts);
-        autoTDPBaseline.MinWatts = AutoTDPFloorW > 0 ? Math.Min(AutoTDPFloorW, level) : (AutoTDPRangeMinW > 0 ? Math.Min(AutoTDPRangeMinW, level) : level);
+        autoTDPBaseline.MinWatts = AutoTDPFloorW > 0 ? AutoTDPFloorW : (AutoTDPRangeMinW > 0 ? AutoTDPRangeMinW : level);
         autoTDPBaseline.MaxWatts = autoTDPBaseline.Samples == 0
             ? sessionMax
             : Math.Max(level, autoTDPBaseline.MaxWatts + AUTOTDP_BASELINE_EWMA * (sessionMax - autoTDPBaseline.MaxWatts));
@@ -1766,7 +2190,8 @@ public static class PerformanceManager
         // span): the seed for later sessions and the value shown as "B" - low enough to be efficient from the first
         // second, high enough that the usual scenes need no climb
         if (autoTDPBaseline.FloorLocked && autoTDPBaseline.MaxWatts > autoTDPBaseline.MinWatts)
-            autoTDPBaseline.RecentWatts = Math.Round(autoTDPBaseline.MinWatts + AUTOTDP_BASELINE_RANGE_BIAS * (autoTDPBaseline.MaxWatts - autoTDPBaseline.MinWatts));
+            autoTDPBaseline.RecentWatts = AutoTDPLearningPolicy.EfficiencyBiasedBaseline(
+                autoTDPBaseline.MinWatts, autoTDPBaseline.MaxWatts, AUTOTDP_BASELINE_RANGE_BIAS);
         autoTDPBaseline.Samples++;
         autoTDPBaseline.LastUpdatedUtc = DateTime.UtcNow;
         autoTDPBaseline.TemperatureAtConvergence = PlatformManager.LibreHardware?.GetCPUTemperature() ?? autoTDPBaseline.TemperatureAtConvergence;
@@ -1779,10 +2204,10 @@ public static class PerformanceManager
         double applied = AutoTDPApplied;
         double? baseline = autoTDPBaseline is not null ? autoTDPBaseline.RecentWatts : null;
 
-        AutoTDPStatus status = new(state, AutoTDPCapped, AutoTDPTargetFPS, AutoTDPWinFps, AutoTDP, applied, baseline, AutoTDPFloorW > 0 ? AutoTDPFloorW : AutoTDPRangeMinW, AutoTDPRangeMaxW, AutoTDPEfficiencyTag(), effPhase != AutoTDPEfficiencyPhase.Idle);
+        AutoTDPStatus status = new(state, AutoTDPPhase, AutoTDPCapped, AutoTDPContentCapFps > 0 ? AutoTDPContentCapFps : null, AutoTDPTargetFPS, AutoTDPWinFps, AutoTDP, applied, baseline, AutoTDPFloorW > 0 ? AutoTDPFloorW : AutoTDPRangeMinW, AutoTDPRangeMaxW, AutoTDPEfficiencyTag(), effPhase != AutoTDPEfficiencyPhase.Idle);
         autoTDPStatus = status;
 
-        if (force || previous.State != state || previous.AppliedW != applied || previous.Capped != AutoTDPCapped || previous.EfficiencyRung != status.EfficiencyRung || previous.Optimizing != status.Optimizing)
+        if (force || previous.State != state || previous.Phase != status.Phase || previous.AppliedW != applied || previous.Capped != AutoTDPCapped || previous.ContentCapFps != status.ContentCapFps || previous.EfficiencyRung != status.EfficiencyRung || previous.Optimizing != status.Optimizing)
         {
             if (previous.State != state)
                 LogManager.LogInformation("AutoTDP state: {0} -> {1} ({2} W applied)", previous.State, state, applied);
@@ -1799,6 +2224,7 @@ public static class PerformanceManager
         AutoTDPStaleSec = 0;
         AutoTDPWinFps = AutoTDPTrimFps = AutoTDPSlowFps = 0;
         AutoTDPP95Ratio = 0;
+        AutoTDPWindowSec = AutoTDPP05Ms = AutoTDPMedianMs = AutoTDPP95Ms = AutoTDPMedianFps = AutoTDPCadenceSpread = 0;
         AutoTDPLongFrames = AutoTDPSevereFrames = 0;
         AutoTDPGpuLoad = null;
     }
@@ -1806,7 +2232,7 @@ public static class PerformanceManager
     private static void AutoTDPResetDwell()
     {
         AutoTDPHeadroomSec = AutoTDPDeficitSec = AutoTDPHoldSec = 0;
-        AutoTDPUpSettleUntilSec = AutoTDPDownSettleUntilSec = AutoTDPLastStutterStepSec = 0;
+        AutoTDPUpSettleUntilSec = AutoTDPDownSettleUntilSec = 0;
         AutoTDPLastDownSec = 0;
         AutoTDPDownFromW = AutoTDPDownToW = 0;
         AutoTDPDownWasProbe = false;
@@ -1818,6 +2244,16 @@ public static class PerformanceManager
         AutoTDPConvergedAtLevel = false;
         AutoTDPMaxLimitedSec = 0;
         AutoTDPPendingW = 0;
+        AutoTDPCoarseReadySec = AutoTDPCoarseFailSec = AutoTDPCoarseStableSec = AutoTDPCoarseAmbiguousSec = 0;
+        AutoTDPCoarseLastPassW = 0;
+        AutoTDPFineHasProbed = false;
+        AutoTDPPreviousMedianFps = AutoTDPSceneGraceUntilSec = 0;
+        AutoTDPContentCandidateSec = AutoTDPContentCandidateFps = AutoTDPContentPreW = 0;
+        AutoTDPContentCapFps = AutoTDPContentExitSec = 0;
+        AutoTDPContentProbeActive = false;
+        AutoTDPPhaseBeforeContentCap = AutoTDPLearningPhase.None;
+        AutoTDPFloorRevalidateIntervalSec = AUTOTDP_FLOOR_REVALIDATE_SEC;
+        AutoTDPDownWasRevalidation = false;
     }
 
     private static void AutoTDPSeedFromBaseline()
@@ -1941,7 +2377,7 @@ public static class PerformanceManager
         // is allowed after the session has been quiet for a long time (game patches, cooler device), see AutoTDPStep.
         if (autoTDPBaseline.FloorLocked && autoTDPBaseline.MinWatts > 0)
             AutoTDPProbeFailures = AUTOTDP_PROBE_MAX_FAILURES;
-        AutoTDPFloorRevalidated = false;
+        AutoTDPFloorRevalidateIntervalSec = AUTOTDP_FLOOR_REVALIDATE_SEC;
     }
 
     /// <summary>
@@ -2020,7 +2456,7 @@ public static class PerformanceManager
                     Directory.CreateDirectory(App.LogsPath);
                     string path = Path.Combine(App.LogsPath, $"autotdp-{DateTime.Now:yyyyMMdd-HHmmss-fff}.csv");
                     autoTDPTrace = new StreamWriter(path, false) { AutoFlush = true };
-                    autoTDPTrace.WriteLine("t,fps,trimFps,slowFps,p95Ratio,longFrames,severeFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key");
+                    autoTDPTrace.WriteLine("t,fps,trimFps,slowFps,p95Ratio,longFrames,severeFrames,gpuLoad,capped,setpoint,applied,state,reason,rangeMin,rangeMax,floor,key,phase,medianFps,cadenceSpread,contentCapFps");
                     LogManager.LogInformation("AutoTDP trace: {0}", path);
                 }
 
@@ -2041,7 +2477,11 @@ public static class PerformanceManager
                     AutoTDPRangeMinW.ToString("F0", CultureInfo.InvariantCulture),
                     AutoTDPRangeMaxW.ToString("F0", CultureInfo.InvariantCulture),
                     AutoTDPFloorW.ToString("F0", CultureInfo.InvariantCulture),
-                    AutoTDPBaselineKey));
+                    AutoTDPBaselineKey,
+                    AutoTDPPhase,
+                    AutoTDPMedianFps.ToString("F2", CultureInfo.InvariantCulture),
+                    AutoTDPCadenceSpread.ToString("F3", CultureInfo.InvariantCulture),
+                    AutoTDPContentCapFps > 0 ? AutoTDPContentCapFps.ToString("F2", CultureInfo.InvariantCulture) : string.Empty));
             }
             catch (Exception ex)
             {

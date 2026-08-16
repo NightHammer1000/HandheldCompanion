@@ -50,6 +50,9 @@
 	<ItemGroup>
 		<!-- Prevent Server GC from scaling back heaps during idle; avoids ramp-up latency on sudden load -->
 		<RuntimeHostConfigurationOption Include="System.GC.GarbageCollectionAdaptationMode" Value="0" Trim="true" />
+		<AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+			<_Parameter1>HandheldCompanion.Tests</_Parameter1>
+		</AssemblyAttribute>
 	</ItemGroup>
 	<ItemGroup>
 		<Page Remove="Properties\DesignTimeResources.xaml" />

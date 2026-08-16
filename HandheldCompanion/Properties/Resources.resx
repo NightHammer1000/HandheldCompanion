@@ -1179,6 +1179,15 @@ Motion input toggle: press selected button(s) to switch motion state.</value>
   <data name="ProfilesPage_AutoTDPStatusLearning" xml:space="preserve">
     <value>Learning · now {0:0} W · floor {1} · max {2}</value>
   </data>
+  <data name="ProfilesPage_AutoTDPStatusLearningFPS" xml:space="preserve">
+    <value>Learning FPS · now {0:0} W · baseline {1}</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusLearningFrametime" xml:space="preserve">
+    <value>Learning frametime · baseline {0} · candidate floor {1} · now {2:0} W</value>
+  </data>
+  <data name="ProfilesPage_AutoTDPStatusContentCapped" xml:space="preserve">
+    <value>Paused · content capped near {0:0} FPS · holding {1:0} W</value>
+  </data>
   <data name="ProfilesPage_AutoTDPStatusTracking" xml:space="preserve">
     <value>Tracking · baseline {0:0} W · floor {1:0} W · max {2:0} W · now {3:0} W</value>
   </data>

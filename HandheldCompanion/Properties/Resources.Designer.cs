@@ -8994,6 +8994,33 @@ namespace HandheldCompanion.Properties {
         }
 
         /// <summary>
+        ///   Looks up a localized string similar to Learning FPS · now {0:0} W · baseline {1}.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusLearningFPS {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusLearningFPS", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Learning frametime · baseline {0} · candidate floor {1} · now {2:0} W.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusLearningFrametime {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusLearningFrametime", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Paused · content capped near {0:0} FPS · holding {1:0} W.
+        /// </summary>
+        public static string ProfilesPage_AutoTDPStatusContentCapped {
+            get {
+                return ResourceManager.GetString("ProfilesPage_AutoTDPStatusContentCapped", resourceCulture);
+            }
+        }
+
+        /// <summary>
         ///   Looks up a localized string similar to Tracking · baseline {0:0} W · floor {1:0} W · max {2:0} W · now {3:0} W.
         /// </summary>
         public static string ProfilesPage_AutoTDPStatusTracking {

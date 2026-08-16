@@ -1,3 +1,4 @@
+using System;
 using System.Globalization;
 
 namespace HandheldCompanion.Managers.Overlay.Widget;
@@ -23,7 +24,7 @@ public class AutoTDPWidget : IWidget
         if (status.State == AutoTDPState.Disabled)
             return;
 
-        string color = StateColor(status.State);
+        string color = status.Phase == AutoTDPLearningPhase.ContentCapped ? OverlayColors.AUTOTDP_IDLE : StateColor(status.State);
         entry.elements.Add(new OverlayEntryElement(Marker, string.Empty, color));
 
         if (status.State == AutoTDPState.NoTelemetry)
@@ -67,6 +68,15 @@ public class AutoTDPWidget : IWidget
 
     private static string StateWord(AutoTDPStatus status)
     {
+        if (status.Phase == AutoTDPLearningPhase.ContentCapped)
+            return "CAP" + Math.Round(status.ContentCapFps ?? status.Fps).ToString(CultureInfo.InvariantCulture);
+
+        if (status.Phase is AutoTDPLearningPhase.WaitingForTarget or AutoTDPLearningPhase.CoarseDown or AutoTDPLearningPhase.CoarseRecover)
+            return "COARSE";
+
+        if (status.Phase == AutoTDPLearningPhase.FineFloor)
+            return "FINE";
+
         string word = status.State switch
         {
             AutoTDPState.Learning => "LEARN",
